@@ -68,8 +68,14 @@ class VGGT4Track(nn.Module, PyTorchModelHubMixin):
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
         
+        # Optimization: Request only necessary layers from aggregator
+        if hasattr(self.depth_head, "intermediate_layer_idx"):
+            intermediate_layers = self.depth_head.intermediate_layer_idx
+        else:
+            intermediate_layers = None
+
         with torch.no_grad():
-            aggregated_tokens_list, patch_start_idx = self.aggregator(images_proc)
+            aggregated_tokens_list, patch_start_idx = self.aggregator(images_proc, intermediate_layers=intermediate_layers)
 
         predictions = {}
 
@@ -80,14 +86,27 @@ class VGGT4Track(nn.Module, PyTorchModelHubMixin):
                 predictions["pose_enc_list"] = pose_enc_list
 
             if self.depth_head is not None:
+                # Temporarily update indices to match the filtered list
+                original_idx = self.depth_head.intermediate_layer_idx
+                if intermediate_layers is not None:
+                    self.depth_head.intermediate_layer_idx = list(range(len(intermediate_layers)))
+                
+                # Optimization: Process depth in chunks to save memory
                 depth, depth_conf = self.depth_head(
-                    aggregated_tokens_list, images=images_proc, patch_start_idx=patch_start_idx
+                    aggregated_tokens_list, images=images_proc, patch_start_idx=patch_start_idx,
+                    frames_chunk_size=kwargs.get("frames_chunk_size", 1)
                 )
+                
+                # Restore original indices
+                self.depth_head.intermediate_layer_idx = original_idx
+                
                 predictions["depth"] = depth
                 predictions["unc_metric"] = depth_conf.view(B*T, H_proc, W_proc)
 
-        predictions["images"] = (images)*255.0
-                                                         
+        # Optimization: Do not keep a full copy of images on GPU if possible
+        # predictions["images"] = (images)*255.0
+        # If the user really needs it, they can use the input 'images'
+        
         # output the camera pose
         predictions["poses_pred"] = torch.eye(4)[None].repeat(T, 1, 1)[None]
         predictions["poses_pred"][:,:,:3,:4], predictions["intrs"] = pose_encoding_to_extri_intri(predictions["pose_enc_list"][-1],

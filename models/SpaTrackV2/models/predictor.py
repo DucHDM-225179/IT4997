@@ -65,9 +65,8 @@ class Predictor(torch.nn.Module, PyTorchModelHubMixin):
         T_, C, H, W = video.shape
         step_slide = self.S_wind - self.overlap
         if T_ > self.S_wind:
-            
-            num_windows = (T_ - self.S_wind + step_slide) // step_slide 
-            T = num_windows * step_slide + self.S_wind
+            num_slides = (T_ - self.S_wind + step_slide - 1) // step_slide 
+            T = num_slides * step_slide + self.S_wind
             pad_len = T - T_
 
             video = torch.cat([video, video[-1:].repeat(T-video.shape[0], 1, 1, 1)], dim=0)
@@ -83,9 +82,20 @@ class Predictor(torch.nn.Module, PyTorchModelHubMixin):
             ret = self.spatrack.forward_stream(video, queries, T_org=T_,
                                                 depth=depth, intrs=intrs, unc_metric_in=unc_metric, extrs=extrs, queries_3d=queries_3d,
                                                 window_len=self.S_wind, overlap_len=self.overlap, track2d_gt=track2d_gt, full_point=full_point, iters_track=iters_track,
-                                                fixed_cam=fixed_cam, query_no_BA=query_no_BA, stage=stage, support_frame=support_frame, replace_ratio=replace_ratio) + (video[:T_],)
+                                                fixed_cam=fixed_cam, query_no_BA=query_no_BA, stage=stage, support_frame=support_frame, replace_ratio=replace_ratio)
+        
+        # Explicitly trim all results to original length T_ to avoid repetition at the end
+        if isinstance(ret, tuple):
+            ret = tuple(r[:T_] if isinstance(r, (torch.Tensor, np.ndarray)) and r.shape[0] >= T_ else r for r in ret)
+        elif isinstance(ret, dict):
+            for k in ret.keys():
+                if isinstance(ret[k], (torch.Tensor, np.ndarray)):
+                    if ret[k].shape[0] > T_:
+                        ret[k] = ret[k][:T_]
+                    elif len(ret[k].shape) > 1 and ret[k].shape[0] == 1 and ret[k].shape[1] > T_:
+                        ret[k] = ret[k][:, :T_]
             
-        return ret
+        return ret + (video[:T_],)
 
     
         

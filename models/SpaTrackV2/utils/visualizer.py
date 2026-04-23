@@ -43,7 +43,7 @@ class Visualizer:
         fps: int = 10,
         mode: str = "rainbow",  # 'cool', 'optical_flow'
         linewidth: int = 2,
-        show_first_frame: int = 10,
+        show_first_frame: int = 0,
         tracks_leave_trace: int = 0,  # -1 for infinite
     ):
         self.mode = mode
@@ -133,7 +133,7 @@ class Visualizer:
             os.makedirs(self.save_dir, exist_ok=True)
             wide_list = list(video.unbind(1))
             wide_list = [wide[0].permute(1, 2, 0).cpu().numpy() for wide in wide_list]
-            clip = ImageSequenceClip(wide_list[2:-1], fps=self.fps)
+            clip = ImageSequenceClip(wide_list, fps=self.fps)
 
             # Write the video file
             save_path = os.path.join(self.save_dir, f"{filename}_pred_track.mp4")

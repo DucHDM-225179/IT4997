@@ -149,7 +149,9 @@ class SpaTrack2(nn.Module, PyTorchModelHubMixin):
     ):  
         # step 1 allocate the query points on the grid
         T, C, H, W = video.shape
-
+        if T_org is None:
+            T_org = T
+            
         if annots_train is not None:
             vis_gt = annots_train["vis"]
             _, _, N = vis_gt.shape
@@ -246,9 +248,9 @@ class SpaTrack2(nn.Module, PyTorchModelHubMixin):
             queries_new = sort_query[queries_new_mask.bool()]
             queries_new = queries_new.float()
             if i > 0:
-                overlap2d = track2d_pred[i*step_slide:(i+1)*step_slide, :queries_len, :]
-                overlapvis = vis_pred[i*step_slide:(i+1)*step_slide, :queries_len, :]
-                overlapconf = conf_pred[i*step_slide:(i+1)*step_slide, :queries_len, :]
+                overlap2d = track2d_pred[i*step_slide:i*step_slide+overlap_len, :queries_len, :]
+                overlapvis = vis_pred[i*step_slide:i*step_slide+overlap_len, :queries_len, :]
+                overlapconf = conf_pred[i*step_slide:i*step_slide+overlap_len, :queries_len, :]
                 overlap_query = (overlapvis * overlapconf).max(dim=0)[1][None, ...]
                 overlap_xy = torch.gather(overlap2d, 0, overlap_query.repeat(1,1,2))
                 overlap_d = torch.gather(overlap2d, 0, overlap_query.repeat(1,1,3))[...,2].detach()
@@ -289,7 +291,6 @@ class SpaTrack2(nn.Module, PyTorchModelHubMixin):
             
             kwargs.update({"stage": stage})
             
-            #TODO: DEBUG
             out = self.forward(segment, pts_q=queries_new,
                                 pts_q_3d=queries_new_3d, overlap_d=overlap_d,
                                 full_point=full_point,
@@ -302,13 +303,17 @@ class SpaTrack2(nn.Module, PyTorchModelHubMixin):
                 loss += out["loss"].squeeze()
 
             queries_len = len(queries_new)
-            # update the track3d and track2d
-            left_len = len(track3d_pred[i*step_slide:i*step_slide+window_len, :queries_len, :])
-            track3d_pred[i*step_slide:i*step_slide+window_len, :queries_len, :] = out["rgb_tracks"][0,:left_len,:queries_len,:]
-            track2d_pred[i*step_slide:i*step_slide+window_len, :queries_len, :] = out["traj_est"][0,:left_len,:queries_len,:3]
-            vis_pred[i*step_slide:i*step_slide+window_len, :queries_len, :] = out["vis_est"][0,:left_len,:queries_len,None]
-            conf_pred[i*step_slide:i*step_slide+window_len, :queries_len, :] = out["conf_pred"][0,:left_len,:queries_len,None]
-            dyn_preds[i*step_slide:i*step_slide+window_len, :queries_len, :] = out["dyn_preds"][0,:left_len,:queries_len,None]
+            
+            # Determine range to save into global results
+            save_start = 0 if i == 0 else overlap_len
+            idx_glob = i * step_slide
+            
+            # Update the track3d and track2d
+            track3d_pred[idx_glob+save_start:idx_glob+window_len, :queries_len, :] = out["rgb_tracks"][0,save_start:window_len,:queries_len,:]
+            track2d_pred[idx_glob+save_start:idx_glob+window_len, :queries_len, :] = out["traj_est"][0,save_start:window_len,:queries_len,:3]
+            vis_pred[idx_glob+save_start:idx_glob+window_len, :queries_len, :] = out["vis_est"][0,save_start:window_len,:queries_len,None]
+            conf_pred[idx_glob+save_start:idx_glob+window_len, :queries_len, :] = out["conf_pred"][0,save_start:window_len,:queries_len,None]
+            dyn_preds[idx_glob+save_start:idx_glob+window_len, :queries_len, :] = out["dyn_preds"][0,save_start:window_len,:queries_len,None]
 
             # process the output for each segment   
             seg_c2w = out["poses_pred"][0]
@@ -331,31 +336,26 @@ class SpaTrack2(nn.Module, PyTorchModelHubMixin):
                     cache[k] = cache[k][-overlap_len:]
             
             # update the results
-            idx_glob = i * step_slide
-            # refine part
-            # mask_update = sort_query[..., 0] < i * step_slide + window_len
-            # sort_query_pick = sort_query[mask_update]
-            intrs_out[idx_glob:idx_glob+window_len] = seg_intrs
-            point_map[idx_glob:idx_glob+window_len] = seg_point_map
-            unc_metric[idx_glob:idx_glob+window_len] = seg_conf_depth
-            # update the camera poses
+            intrs_out[idx_glob+save_start:idx_glob+window_len] = seg_intrs[save_start:]
+            point_map[idx_glob+save_start:idx_glob+window_len] = seg_point_map[save_start:]
+            unc_metric[idx_glob+save_start:idx_glob+window_len] = seg_conf_depth[save_start:]
             
-            # if using the ground truth pose
-            # if extrs_unf is not None:
-            #     c2w_traj[idx_glob:idx_glob+window_len] = extrs_unf[i:i+1][0].to(c2w_traj.device).to(c2w_traj.dtype)
-            # else:
-            prev_c2w = c2w_traj[idx_glob:idx_glob+window_len][:1]
-            c2w_traj[idx_glob:idx_glob+window_len] = prev_c2w@seg_c2w.to(c2w_traj.device).to(c2w_traj.dtype)
+            # update the camera poses
+            if i == 0:
+                c2w_traj[idx_glob:idx_glob+window_len] = seg_c2w.to(c2w_traj.device).to(c2w_traj.dtype)
+            else:
+                base_c2w = c2w_traj[idx_glob : idx_glob + 1]
+                c2w_traj[idx_glob+save_start:idx_glob+window_len] = base_c2w @ seg_c2w[save_start:].to(c2w_traj.device).to(c2w_traj.dtype)
 
-        track2d_pred = track2d_pred[:T_org,sorted_inv_indices,:]
-        track3d_pred = track3d_pred[:T_org,sorted_inv_indices,:]
-        vis_pred = vis_pred[:T_org,sorted_inv_indices,:]
-        conf_pred = conf_pred[:T_org,sorted_inv_indices,:]
-        dyn_preds = dyn_preds[:T_org,sorted_inv_indices,:]
-        unc_metric = unc_metric[:T_org,:]
-        point_map = point_map[:T_org,:]
-        intrs_out = intrs_out[:T_org,:]
-        c2w_traj = c2w_traj[:T_org,:]
+        track2d_pred = track2d_pred[:,sorted_inv_indices,:]
+        track3d_pred = track3d_pred[:,sorted_inv_indices,:]
+        vis_pred = vis_pred[:,sorted_inv_indices,:]
+        conf_pred = conf_pred[:,sorted_inv_indices,:]
+        dyn_preds = dyn_preds[:,sorted_inv_indices,:]
+        unc_metric = unc_metric[:,:]
+        point_map = point_map[:,:]
+        intrs_out = intrs_out[:,:]
+        c2w_traj = c2w_traj[:,:]
         if self.training:
             ret = {
                 "loss": loss,
@@ -366,22 +366,22 @@ class SpaTrack2(nn.Module, PyTorchModelHubMixin):
                 "conf_loss": out["conf_loss"],
                 "dyn_loss": out["dyn_loss"],
                 "sync_loss": out["sync_loss"],
-                "poses_pred": c2w_traj[None],
-                "intrs": intrs_out[None],
-                "points_map": point_map,
-                "track3d_pred": track3d_pred[None],
-                "rgb_tracks": track3d_pred[None],
-                "track2d_pred": track2d_pred[None],
-                "traj_est": track2d_pred[None],
-                "vis_est": vis_pred[None], "conf_pred": conf_pred[None],
-                "dyn_preds": dyn_preds[None],
-                "imgs_raw": video[None],
-                "unc_metric": unc_metric,
+                "poses_pred": c2w_traj[:][None],
+                "intrs": intrs_out[:][None],
+                "points_map": point_map[:],
+                "track3d_pred": track3d_pred[:][None],
+                "rgb_tracks": track3d_pred[:][None],
+                "track2d_pred": track2d_pred[:][None],
+                "traj_est": track2d_pred[:][None],
+                "vis_est": vis_pred[:][None], "conf_pred": conf_pred[:][None],
+                "dyn_preds": dyn_preds[:][None],
+                "imgs_raw": video[:][None],
+                "unc_metric": unc_metric[:],
                 }
             
             return ret    
         else:
-            return c2w_traj, intrs_out, point_map, unc_metric, track3d_pred, track2d_pred, vis_pred, conf_pred
+            return c2w_traj[:T_org], intrs_out[:T_org], point_map[:T_org], unc_metric[:T_org], track3d_pred[:T_org], track2d_pred[:T_org], vis_pred[:T_org], conf_pred[:T_org]
     def forward(self,
                  x: torch.Tensor,
                  annots: Dict = {},

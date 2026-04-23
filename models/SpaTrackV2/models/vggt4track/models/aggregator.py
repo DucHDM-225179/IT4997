@@ -188,11 +188,14 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
+        intermediate_layers: Optional[List[int]] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            intermediate_layers (list[int], optional): Indices of layers to return. 
+                If None, all layers are returned.
 
         Returns:
             (list[torch.Tensor], int):
@@ -241,7 +244,11 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = []
 
-        for _ in range(self.aa_block_num):
+        total_layers = self.aa_block_num * len(self.aa_order) // 2 # Since we concat frame and global
+        # Actually aa_block_num is self.depth // self.aa_block_size.
+        # Total output_list length will be self.aa_block_num.
+        
+        for block_idx in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
@@ -254,10 +261,11 @@ class Aggregator(nn.Module):
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
-            for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+            if intermediate_layers is None or block_idx in intermediate_layers:
+                for i in range(len(frame_intermediates)):
+                    # concat frame and global intermediates, [B x S x P x 2C]
+                    concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                    output_list.append(concat_inter)
 
         del concat_inter
         del frame_intermediates

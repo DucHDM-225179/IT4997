@@ -1,6 +1,6 @@
 gradio==5.31.0
 pydantic==2.10.6
-opencv-python-headless
+opencv-python
 einops
 einx
 plotly
@@ -23,7 +23,7 @@ git+https://github.com/EasternJournalist/utils3d.git@d3a577acf0a9ad7e513a1416449
 huggingface_hub
 pyceres==2.4
 kornia==0.8.1
-xformers==0.0.28
+xformers
 timm
 PyJWT
 gdown

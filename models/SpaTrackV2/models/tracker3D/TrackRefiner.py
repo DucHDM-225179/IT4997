@@ -11,7 +11,62 @@ from models.SpaTrackV2.models.tracker3D.co_tracker.utils import (
     EfficientUpdateFormer, AttnBlock, Attention, CrossAttnBlock,
     sequence_BCE_loss, sequence_loss, sequence_prob_loss, sequence_dyn_prob_loss, sequence_loss_xyz, balanced_binary_cross_entropy
 )
-from torchvision.io import write_video
+
+
+
+import imageio
+import numpy as np
+
+def write_video(filename, video_array, fps, video_codec='libx264', options=None, 
+                audio_array=None, audio_fps=None, audio_codec=None, audio_options=None):
+    """
+    Drop-in replacement for torchvision.io.write_video using imageio.
+    Matches the exact original signature and expected [T, H, W, C] input.
+    """
+    
+    # 1. Convert Tensor to Numpy [T, H, W, C]
+    if torch.is_tensor(video_array):
+        video_np = video_array.cpu().numpy()
+    else:
+        video_np = video_array
+
+    # 2. Ensure uint8 (imageio requirement for most encoders)
+    if video_np.dtype != np.uint8:
+        if video_np.max() <= 1.0:
+            video_np = (video_np * 255).astype(np.uint8)
+        else:
+            video_np = video_np.astype(np.uint8)
+
+    # 3. Setup Writer
+    # Imageio uses 'macro_block_size' to prevent issues with non-even dimensions
+    # 'ffmpeg_params' allows passing the 'options' dictionary to FFmpeg
+    writer_kwargs = {
+        'fps': fps,
+        'codec': video_codec,
+        'macro_block_size': 8,
+    }
+    
+    if options:
+        # Convert dictionary options to FFmpeg list format if needed
+        # e.g., {'crf': '18'} -> ['-crf', '18']
+        ffmpeg_params = []
+        for k, v in options.items():
+            ffmpeg_params.extend([f"-{k}", str(v)])
+        writer_kwargs['ffmpeg_params'] = ffmpeg_params
+
+    # 4. Handle Audio (if provided)
+    # Note: imageio handles audio through a separate file or temp processing
+    if audio_array is not None:
+        # If you strictly need audio, you'd usually write a temp wav and merge,
+        # but for most tracking/CV tasks, video-only is the priority.
+        import warnings
+        warnings.warn("Audio support in imageio wrapper is limited. Encoding video only.")
+
+    # 5. Write the file
+    imageio.mimwrite(filename, video_np, format='FFMPEG', **writer_kwargs)
+
+
+
 import math
 from models.SpaTrackV2.models.tracker3D.co_tracker.utils import (
     Mlp, BasicEncoder, EfficientUpdateFormer, GeometryEncoder, NeighborTransformer, CorrPointformer
