@@ -2,6 +2,7 @@ import os
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import argparse
 import av
 from models.SpaTrackV2.models.vggt4track.models.vggt_moe import VGGT4Track
@@ -53,34 +54,35 @@ if __name__ == "__main__":
     # Load preprocessed video
     video_tensor, (H_orig, W_orig) = read_video_av(vid_dir, args.fps)
     H_proc, W_proc = video_tensor.shape[-2:]
-    
-    print(f"Loading VGGT4Track model...")
-    vggt4track_model = VGGT4Track.from_pretrained("Yuxihenry/SpatialTrackerV2_Front")
-    vggt4track_model.eval()
-    vggt4track_model = vggt4track_model.to("cuda")
 
-    print(f"Running inference on {video_tensor.shape[0]} frames...")
-    with torch.no_grad():
-        with torch.amp.autocast(device_type="cuda", dtype=dtype):
-            predictions = vggt4track_model(video_tensor[None].cuda() / 255.0)
-            extrinsic, intrinsic = predictions["poses_pred"], predictions["intrs"]
-            depth_map, depth_conf = predictions["points_map"][..., 2], predictions["unc_metric"]
-    
-            # Post-processing: Resize back to original resolution as the model does internally
-            # Correcting dimensions for F.interpolate: [S, 1, H, W] to ensure 2D interpolation
-            depth_tensor_hd = F.interpolate(depth_map[:, None], size=(H_orig, W_orig), mode='bilinear', align_corners=True).squeeze(1)
-            unc_metric_hd = F.interpolate(depth_conf[:, None], size=(H_orig, W_orig), mode='bilinear', align_corners=True).squeeze(1)
-            
-            # Scale intrinsics back to original resolution
-            intrs_hd = intrinsic.clone()
-            intrs_hd[..., 0, :] *= W_orig / W_proc
-            intrs_hd[..., 1, :] *= H_orig / H_proc
+    with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+        print(f"Loading VGGT4Track model...")
+        vggt4track_model = VGGT4Track.from_pretrained("Yuxihenry/SpatialTrackerV2_Front")
+        vggt4track_model.eval()
+        vggt4track_model = vggt4track_model.to("cuda")
 
-            # Extract to CPU
-            depth_tensor = depth_tensor_hd.cpu().numpy()
-            extrs = extrinsic.squeeze().cpu().numpy()
-            intrs = intrs_hd.squeeze().cpu().numpy()
-            unc_metric = unc_metric_hd.cpu().numpy()
+        print(f"Running inference on {video_tensor.shape[0]} frames...")
+        with torch.no_grad():
+            with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                predictions = vggt4track_model(video_tensor[None].cuda() / 255.0)
+                extrinsic, intrinsic = predictions["poses_pred"], predictions["intrs"]
+                depth_map, depth_conf = predictions["points_map"][..., 2], predictions["unc_metric"]
+        
+                # Post-processing: Resize back to original resolution as the model does internally
+                # Correcting dimensions for F.interpolate: [S, 1, H, W] to ensure 2D interpolation
+                depth_tensor_hd = F.interpolate(depth_map[:, None], size=(H_orig, W_orig), mode='bilinear', align_corners=True).squeeze(1)
+                unc_metric_hd = F.interpolate(depth_conf[:, None], size=(H_orig, W_orig), mode='bilinear', align_corners=True).squeeze(1)
+                
+                # Scale intrinsics back to original resolution
+                intrs_hd = intrinsic.clone()
+                intrs_hd[..., 0, :] *= W_orig / W_proc
+                intrs_hd[..., 1, :] *= H_orig / H_proc
+
+                # Extract to CPU
+                depth_tensor = depth_tensor_hd.cpu().numpy()
+                extrs = extrinsic.squeeze().cpu().numpy()
+                intrs = intrs_hd.squeeze().cpu().numpy()
+                unc_metric = unc_metric_hd.cpu().numpy()
             
     # Save intermediate data
     out_name = args.out_name if args.out_name else f"{args.video_name}_intermediate.npz"
