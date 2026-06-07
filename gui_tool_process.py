@@ -12,11 +12,188 @@ from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QBrush, QColor, QPen
 from PyQt6.QtWidgets import (QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsSimpleTextItem, 
-                             QGraphicsRectItem)
+                             QGraphicsRectItem, QMessageBox, QApplication)
 
 from gui_tool_base import BaseTool
 from models.SpaTrackV2.models.predictor import Predictor
 from models.monoD.depth_anything_v2.util.transform import Resize
+
+
+def get_video_dimensions(video_path):
+    """Fallback function to safely read video dimensions using PyAV if the cached dimensions are empty."""
+    import av
+    try:
+        container = av.open(video_path, container_options={'ignore_editlist': '1'})
+        video_stream = container.streams.video[0]
+        w, h = video_stream.width, video_stream.height
+        container.close()
+        return w, h
+    except Exception as e:
+        print(f"Error getting video dimensions: {e}")
+        return 1920, 1080  # Reasonable HD fallback
+
+
+def generate_blender_script(npz_path, video_path, width, height, stride, start_frame):
+    """
+    Reads the blender_loading_script_template.py file, substitutes placeholder strings
+    with resolved configuration parameters, and returns the customized Blender import script.
+    """
+    # Normalized paths to use forward slashes so they execute safely in Blender on Windows
+    npz_norm = os.path.abspath(npz_path).replace("\\", "/")
+    video_norm = os.path.abspath(video_path).replace("\\", "/")
+    
+    # Try reading the template file from the workspace/local directory
+    # Template should be located in the project's root folder
+    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_loading_script_template.py")
+    template_code = None
+    
+    if os.path.exists(template_path):
+        try:
+            with open(template_path, "r", encoding="utf-8") as f:
+                template_code = f.read()
+        except Exception as e:
+            print(f"Error reading template file: {e}")
+
+    if not template_code:
+        # Fallback inline copy of the template in case the file is missing/unreadable
+        template_code = """import bpy
+import numpy as np
+import os
+from mathutils import Matrix, Vector
+
+# --- CONFIGURATION ---
+NPZ_PATH = "TO_BE_REPLACED_NPZ_PATH"
+VIDEO_PATH = "TO_BE_REPLACED_VIDEO_PATH" 
+ORIGINAL_RES = TO_BE_REPLACED_ORIGINAL_RES # (Width, Height)
+FRAME_STRIDE = TO_BE_REPLACED_FRAME_STRIDE
+START_FRAME = TO_BE_REPLACED_START_FRAME
+# ---------------------
+
+def create_blender_camera(data):
+    intrinsics = data['intrinsics'][0] 
+    W_orig, H_orig = ORIGINAL_RES
+    
+    # Create camera
+    cam_data = bpy.data.cameras.new("SpaTrackCam")
+    cam_obj = bpy.data.objects.new("SpaTrackCam", cam_data)
+    bpy.context.collection.objects.link(cam_obj)
+    
+    # 1. Handle Focal Length (FOV)
+    fy = intrinsics[1, 1]
+    fov_v = 2 * np.arctan(H_orig / (2 * fy))
+    
+    cam_data.lens_unit = 'FOV'
+    cam_data.sensor_fit = 'VERTICAL'
+    cam_data.angle = fov_v
+    
+    # 2. Principal Point Shift
+    cam_data.shift_x = (intrinsics[0, 2] - W_orig / 2) / H_orig
+    cam_data.shift_y = (H_orig / 2 - intrinsics[1, 2]) / H_orig
+    
+    # Setup Background Video
+    if os.path.exists(VIDEO_PATH):
+        cam_data.show_background_images = True
+        bg = cam_data.background_images.new()
+        bg.source = 'MOVIE_CLIP'
+        clip = bpy.data.movieclips.load(VIDEO_PATH)
+        bg.clip = clip
+        bg.frame_method = 'STRETCH'
+        bg.alpha = 1.0
+
+    return cam_obj
+
+def load_spatrack_data(npz_path):
+    data = np.load(npz_path)
+    coords_3d = data['coords']      # (T, N, 3) World space
+    tracks_2d = data['tracks_2d']    # (T, N, 2) Image space (pixels)
+    extrinsics = data['extrinsics'] # (T, 4, 4) W2C
+    intrinsics = data['intrinsics'] # (T, 3, 3)
+    visibs = data['visibs']         # (T, N)
+    T, N, _ = coords_3d.shape
+    
+    # Use Y-scale as master scale for units
+    master_scale = 1.0 
+
+    # 1. Setup Scene
+    # Total frames is determined by data, but we offset by START_FRAME
+    bpy.context.scene.frame_start = START_FRAME
+    bpy.context.scene.frame_end = START_FRAME + (T - 1) * FRAME_STRIDE
+    bpy.context.scene.render.resolution_x = ORIGINAL_RES[0]
+    bpy.context.scene.render.resolution_y = ORIGINAL_RES[1]
+    
+    # 2. Camera
+    cam_obj = create_blender_camera(data)
+    
+    # 3. Coordinate Transformation Matrices
+    m_world_cv_to_bl = Matrix(((1,0,0,0),(0,0,1,0),(0,-1,0,0),(0,0,0,1)))
+    m_cam_cv_to_bl = Matrix(((1,0,0,0),(0,-1,0,0),(0,0,-1,0),(0,0,0,1)))
+
+    # 4. Animate Camera
+    for t in range(T):
+        blender_frame = START_FRAME + t * FRAME_STRIDE
+        w2c = Matrix(extrinsics[t].tolist())
+        c2w_cv = w2c.inverted()
+        cam_obj.matrix_world = m_world_cv_to_bl @ c2w_cv @ m_cam_cv_to_bl
+        cam_obj.keyframe_insert(data_path="location", frame=blender_frame)
+        cam_obj.keyframe_insert(data_path="rotation_euler", frame=blender_frame)
+
+    # 5. Create Point Tracks with 2D Guidance
+    points_parent = bpy.data.objects.new("Tracks", None)
+    bpy.context.collection.objects.link(points_parent)
+    
+    for n in range(N):
+        empty = bpy.data.objects.new(f"Track_{n:04d}", None)
+        empty.parent = points_parent
+        empty.empty_display_size = 0.05
+        empty.empty_display_type = 'PLAIN_AXES'
+        bpy.context.collection.objects.link(empty)
+        
+        for t in range(T):
+            blender_frame = START_FRAME + t * FRAME_STRIDE
+            
+            # 2D guiding: Project 3D point onto the ray defined by 2D track
+            # to ensure perfect visual alignment.
+            p_world = Vector(coords_3d[t, n])
+            uv = tracks_2d[t, n] # (u, v) in pixels
+            K = intrinsics[t]
+            w2c = Matrix(extrinsics[t].tolist())
+            
+            # Ray direction in camera space
+            # d = K^-1 * [u, v, 1]^T
+            fx, fy = K[0, 0], K[1, 1]
+            cx, cy = K[0, 2], K[1, 2]
+            ray_dir_cam = Vector(((uv[0] - cx) / fx, (uv[1] - cy) / fy, 1.0))
+            
+            # Target depth in camera space (Z forward)
+            p_cam_target = w2c @ p_world
+            depth = p_cam_target.z
+            
+            # Adjusted point in camera space: follow ray to target depth
+            p_cam_corr = ray_dir_cam * depth
+            
+            # Back to world space (CV convention)
+            c2w = w2c.inverted()
+            p_world_corr = c2w @ p_cam_corr
+            
+            # Map CV coordinates to Blender Space
+            empty.location = (p_world_corr.x, p_world_corr.z, -p_world_corr.y)
+            
+            empty.keyframe_insert(data_path="location", frame=blender_frame)
+
+    print(f"Import Finished. Refined with 2D guiding for {N} tracks.")
+
+if __name__ == "__main__":
+    load_spatrack_data(NPZ_PATH)"""
+
+    # Clean string replacements of placeholders
+    code = (template_code
+            .replace('"TO_BE_REPLACED_NPZ_PATH"', f'"{npz_norm}"')
+            .replace('"TO_BE_REPLACED_VIDEO_PATH"', f'"{video_norm}"')
+            .replace('TO_BE_REPLACED_ORIGINAL_RES', f'({width}, {height})')
+            .replace('TO_BE_REPLACED_FRAME_STRIDE', str(stride))
+            .replace('TO_BE_REPLACED_START_FRAME', str(start_frame)))
+            
+    return code
 
 
 def farthest_point_sampling(pts_3d: np.ndarray, num_points: int) -> np.ndarray:
@@ -252,6 +429,8 @@ class TrackingThread(QThread):
             self.progress.emit("Loading Predictor model (Online mode) to CUDA...")
             model = Predictor.from_pretrained("Yuxihenry/SpatialTrackerV2-Online")
             model.spatrack.track_num = self.vo_points
+            model.S_wind = 30
+            model.overlap = 10
             model.eval()
             model.to("cuda")
 
@@ -270,7 +449,7 @@ class TrackingThread(QThread):
                     ) = model.forward(video_tensor, depth=depth_tensor,
                                         intrs=intrs_in, extrs=extrs_in, 
                                         queries=query_xyt,
-                                        fps=1, full_point=False, iters_track=4,
+                                        fps=1, full_point=False, iters_track=8,
                                         query_no_BA=True, fixed_cam=False, stage=1, unc_metric=unc_metric,
                                         support_frame=len(video_tensor)-1, replace_ratio=0.2)
 
@@ -325,6 +504,9 @@ class ProcessVideoTool(BaseTool):
         self.coords_3d = None # (T, N, 3)
         self.visibs = None # (T, N)
         self.tracking_results = None # Full dictionary
+        self.last_saved_npz = ""
+        self.video_width = 0
+        self.video_height = 0
         
         self.overlay_items = []
         self.thread = None
@@ -497,6 +679,12 @@ class ProcessVideoTool(BaseTool):
         self.btn_save_result.clicked.connect(self._on_save_result)
         layout.addWidget(self.btn_save_result)
         
+        self.btn_gen_blender = QPushButton("Generate Blender Script")
+        self.btn_gen_blender.setEnabled(False)
+        self.btn_gen_blender.setStyleSheet("background-color: #E1E1E1; font-weight: bold; padding: 4px;")
+        self.btn_gen_blender.clicked.connect(self._on_generate_blender_script)
+        layout.addWidget(self.btn_gen_blender)
+        
         self.btn_load_result = QPushButton("Load Tracking Result [load result]")
         self.btn_load_result.setStyleSheet("background-color: #E1E1E1; font-weight: bold; padding: 4px;")
         self.btn_load_result.clicked.connect(self._on_load_result)
@@ -608,6 +796,8 @@ class ProcessVideoTool(BaseTool):
         self.visibs = None
         self.tracking_results = None
         self.btn_save_result.setEnabled(False)
+        self.btn_gen_blender.setEnabled(False)
+        self.btn_gen_blender.setStyleSheet("background-color: #E1E1E1; font-weight: bold; padding: 4px;")
         self.lbl_pts_count.setText("Selected Points: 0")
         self._try_auto_load_preprocess()
         self.update_overlay()
@@ -637,6 +827,8 @@ class ProcessVideoTool(BaseTool):
         self.visibs = None
         self.tracking_results = None
         self.btn_save_result.setEnabled(False)
+        self.btn_gen_blender.setEnabled(False)
+        self.btn_gen_blender.setStyleSheet("background-color: #E1E1E1; font-weight: bold; padding: 4px;")
         self.lbl_pts_count.setText("Selected Points: 0")
         self.lbl_status.setText("Status: Cleared all points.")
         self.update_overlay()
@@ -694,6 +886,8 @@ class ProcessVideoTool(BaseTool):
                         self.visibs = None
                         self.tracking_results = None
                         self.btn_save_result.setEnabled(False)
+                        self.btn_gen_blender.setEnabled(False)
+                        self.btn_gen_blender.setStyleSheet("background-color: #E1E1E1; font-weight: bold; padding: 4px;")
 
         self.update_overlay()
 
@@ -795,6 +989,9 @@ class ProcessVideoTool(BaseTool):
         self.btn_load_prep.setEnabled(False)
         self.btn_clear_pts.setEnabled(False)
         self.btn_load_result.setEnabled(False)
+        self.btn_save_result.setEnabled(False)
+        self.btn_gen_blender.setEnabled(False)
+        self.btn_gen_blender.setStyleSheet("background-color: #E1E1E1; font-weight: bold; padding: 4px;")
         self.lbl_status.setText("Status: Preparing tracking background thread...")
         self.lbl_status.setStyleSheet("color: #0078D7; font-weight: bold;")
 
@@ -832,6 +1029,8 @@ class ProcessVideoTool(BaseTool):
             self.visibs = self.robust_squeeze_visibs(results["visibs"])
             
             self.btn_save_result.setEnabled(True)
+            self.btn_gen_blender.setEnabled(True)
+            self.btn_gen_blender.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 4px;")
             self.lbl_status.setText("Status: Tracking completed successfully! Play video to see trajectories.")
             self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
         else:
@@ -1018,11 +1217,14 @@ class ProcessVideoTool(BaseTool):
                 "preprocess_json": os.path.abspath(self.preprocess_json),
                 "points": self.points,
                 "vo_points": self.spin_vo.value(),
-                "result_npz": os.path.abspath(filename)
+                "result_npz": os.path.abspath(filename),
+                "video_width": self.video_width,
+                "video_height": self.video_height
             }
             with open(meta_path, 'w') as f:
                 json.dump(metadata, f, indent=4)
                 
+            self.last_saved_npz = os.path.abspath(filename)
             self.lbl_status.setText(f"Status: Saved result to {os.path.basename(filename)}")
             self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
         except Exception as e:
@@ -1071,6 +1273,8 @@ class ProcessVideoTool(BaseTool):
             self.step = meta.get("step", 1)
             self.points = meta.get("points", [])
             self.spin_vo.setValue(meta.get("vo_points", 120))
+            self.video_width = meta.get("video_width", 0)
+            self.video_height = meta.get("video_height", 0)
             
             # Apply active trim restrictions
             self.main_window.apply_timeline_restriction(self.start_frame, self.end_frame)
@@ -1088,6 +1292,7 @@ class ProcessVideoTool(BaseTool):
             self.lbl_status.setText("Loading tracking results into memory...")
             results_npz = np.load(result_npz, allow_pickle=True)
             self.tracking_results = dict(results_npz)
+            self.last_saved_npz = os.path.abspath(result_npz)
             
             self.tracks_2d = self.robust_squeeze_tracks(self.tracking_results["tracks_2d"])
             if self.tracks_2d is not None and self.tracks_2d.shape[-1] >= 2:
@@ -1100,6 +1305,8 @@ class ProcessVideoTool(BaseTool):
             self.lbl_prep_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
             
             self.btn_save_result.setEnabled(True)
+            self.btn_gen_blender.setEnabled(True)
+            self.btn_gen_blender.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; padding: 4px;")
             self.lbl_status.setText(f"Status: Session loaded successfully! Track results ready.")
             self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
             
@@ -1111,6 +1318,74 @@ class ProcessVideoTool(BaseTool):
             self.lbl_status.setText(f"Status: Load session failed! Error: {e}")
             self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
             self.update_overlay()
+
+    def _on_generate_blender_script(self):
+        if not self.video_path:
+            QMessageBox.warning(self, "Warning", "No video loaded!")
+            return
+            
+        npz_path = getattr(self, 'last_saved_npz', '')
+        if not npz_path:
+            # Result needs to be saved first so we can reference its absolute path
+            reply = QMessageBox.question(
+                self, 
+                "Save Tracking Result First", 
+                "The tracking result needs to be saved as an NPZ file before generating the Blender script, so the script can reference the correct absolute file path.\n\nWould you like to save the tracking result now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._on_save_result()
+                npz_path = getattr(self, 'last_saved_npz', '')
+                if not npz_path:
+                    # User cancelled the save dialog
+                    return
+            else:
+                return
+                
+        # Resolve dimensions
+        w = getattr(self, 'video_width', 0)
+        h = getattr(self, 'video_height', 0)
+        if w <= 0 or h <= 0:
+            # Query PyAV fallback
+            w, h = get_video_dimensions(self.video_path)
+            self.video_width = w
+            self.video_height = h
+            
+        # Generate script code
+        stride = self.step
+        start_frame = self.start_frame
+        
+        try:
+            script_code = generate_blender_script(
+                npz_path=npz_path,
+                video_path=self.video_path,
+                width=w,
+                height=h,
+                stride=stride,
+                start_frame=start_frame
+            )
+            
+            # Copy to clipboard
+            clipboard = QApplication.clipboard()
+            clipboard.setText(script_code)
+            
+            # Non-disruptive button styling feedback
+            old_style = self.btn_gen_blender.styleSheet()
+            old_text = self.btn_gen_blender.text()
+            
+            self.btn_gen_blender.setText("Copied to Clipboard!")
+            self.btn_gen_blender.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 4px;")
+            self.lbl_status.setText("Status: Blender import script copied directly to clipboard!")
+            self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            
+            # Restore button after 1.5 seconds
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(1500, lambda: self.btn_gen_blender.setText(old_text))
+            QTimer.singleShot(1500, lambda: self.btn_gen_blender.setStyleSheet(old_style))
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Generation Failed", f"Failed to generate Blender script:\n{e}")
 
     def _on_box_selected(self, x1, y1, x2, y2):
         """Triggered from main window VideoGraphicsView when box selection is completed."""

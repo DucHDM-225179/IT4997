@@ -75,7 +75,9 @@ class VideoDecoderThread(QThread):
             return {
                 "fps": self.fps,
                 "total_frames": self.total_frames,
-                "duration_sec": self.duration_sec
+                "duration_sec": self.duration_sec,
+                "width": self.video_stream.width if self.video_stream else 0,
+                "height": self.video_stream.height if self.video_stream else 0
             }
 
     def play(self):
