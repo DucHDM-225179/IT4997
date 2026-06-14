@@ -456,58 +456,21 @@ class PreprocessTool(BaseTool):
             self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
 
     def _on_load(self):
-        from PyQt6.QtWidgets import QFileDialog
-        
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "Load Preprocessed Metadata", "", "JSON Files (*.json)"
-        )
-        if not filename:
-            return
-            
+        from gui_preprocess_loader import load_preprocess_metadata
         try:
-            with open(filename, 'r') as f:
-                metadata = json.load(f)
-                
-            video_path = metadata.get("video_path")
-            start_frame = metadata.get("start_frame")
-            end_frame = metadata.get("end_frame")
-            step = metadata.get("step", 1)
-            npz_path = metadata.get("npz_path")
-            
-            if not os.path.exists(video_path):
-                # Try relative resolution path based on metadata file's folder
-                dir_meta = os.path.dirname(filename)
-                rel_video_path = os.path.join(dir_meta, os.path.basename(video_path))
-                if os.path.exists(rel_video_path):
-                    video_path = rel_video_path
-                else:
-                    self.lbl_status.setText(f"<b>Status:</b> Error - Video not found at:<br>{video_path}")
-                    self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
-                    return
-            
-            # Load video via main window
-            success = self.main_window.load_video(video_path)
-            if not success:
-                self.lbl_status.setText("<b>Status:</b> Error - Failed to load video.")
-                self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
+            meta, filename = load_preprocess_metadata(self.main_window, self)
+            if not meta:
                 return
                 
-            # Apply trim restriction and sync TrimTool fields
-            from gui_tool_trim import TrimTool
-            for tool in self.main_window.tools:
-                if isinstance(tool, TrimTool):
-                    tool.start_frame = start_frame
-                    tool.end_frame = end_frame
-                    tool._update_labels()
-                    self.main_window.apply_timeline_restriction(start_frame, end_frame)
-                    break
+            step = meta.get("step", 1)
+            npz_path = meta.get("npz_path") or meta.get("preprocess_npz")
             
+            self.video_path = getattr(self.main_window, 'current_video_path', '')
             self.spin_step.setValue(step)
             self._update_paths_label()
             
             self.lbl_status.setText(f"<b>Status:</b> Loaded successfully!<br>NPZ: {os.path.basename(npz_path)}")
             self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
-            
         except Exception as e:
             self.lbl_status.setText(f"<b>Status:</b> Load failed!<br>Error: {str(e)}")
             self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")

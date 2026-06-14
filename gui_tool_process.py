@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
                              QSpinBox, QDoubleSpinBox, QWidget, QFileDialog, QButtonGroup, QGraphicsView,
-                             QGroupBox, QRadioButton, QCheckBox)
+                             QGroupBox, QRadioButton, QCheckBox, QComboBox)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QBrush, QColor, QPen
 from PyQt6.QtWidgets import (QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsSimpleTextItem, 
@@ -319,7 +319,7 @@ class TrackingThread(QThread):
     progress = pyqtSignal(str) # Status messages
     finished = pyqtSignal(bool, dict, str) # (success, results_dict, error_msg)
 
-    def __init__(self, video_path, start_frame, end_frame, step, npz_preprocess_path, points, vo_points=120, pts_map=None):
+    def __init__(self, video_path, start_frame, end_frame, step, npz_preprocess_path, points, vo_points=120, pts_map=None, fixed_cam=False, model_name="Yuxihenry/SpatialTrackerV2-Online", s_wind=30, overlap=10):
         super().__init__()
         self.video_path = video_path
         self.start_frame = start_frame
@@ -329,6 +329,10 @@ class TrackingThread(QThread):
         self.points = points  # List of (x, y) in original HD resolution
         self.vo_points = vo_points
         self.pts_map = pts_map or []
+        self.fixed_cam = fixed_cam
+        self.model_name = model_name
+        self.s_wind = s_wind
+        self.overlap = overlap
 
     def run(self):
         try:
@@ -354,8 +358,8 @@ class TrackingThread(QThread):
             self.progress.emit(f"Decoding and resizing {total_frames_to_decode} frames for tracking...")
             
             resizer = Resize(
-                width=518,
-                height=518,
+                width=336,
+                height=336,
                 resize_target=False,
                 keep_aspect_ratio=True,
                 ensure_multiple_of=14,
@@ -399,6 +403,7 @@ class TrackingThread(QThread):
             depth_in = preprocess_data["depths"]
             intrs_in = preprocess_data["intrinsics"]
             extrs_in = preprocess_data["extrinsics"]
+            extrs_in_c2w = np.linalg.inv(extrs_in).astype(np.float32)
             unc_metric_in = preprocess_data["unc_metric"]
 
             self.progress.emit("Interpolating depth and camera parameters to matched resolution...")
@@ -426,11 +431,11 @@ class TrackingThread(QThread):
                 query_xyt[idx, 1] = x_proc
                 query_xyt[idx, 2] = y_proc
 
-            self.progress.emit("Loading Predictor model (Online mode) to CUDA...")
-            model = Predictor.from_pretrained("Yuxihenry/SpatialTrackerV2-Online")
+            self.progress.emit(f"Loading Predictor model ({self.model_name}) to CUDA...")
+            model = Predictor.from_pretrained(self.model_name)
             model.spatrack.track_num = self.vo_points
-            model.S_wind = 30
-            model.overlap = 10
+            model.S_wind = self.s_wind
+            model.overlap = self.overlap
             model.eval()
             model.to("cuda")
 
@@ -447,10 +452,10 @@ class TrackingThread(QThread):
                         c2w_traj, intrs, point_map, conf_depth,
                         track3d_pred, track2d_pred, vis_pred, conf_pred, video
                     ) = model.forward(video_tensor, depth=depth_tensor,
-                                        intrs=intrs_in, extrs=extrs_in, 
+                                        intrs=intrs_in, extrs=extrs_in_c2w, 
                                         queries=query_xyt,
                                         fps=1, full_point=False, iters_track=8,
-                                        query_no_BA=True, fixed_cam=False, stage=1, unc_metric=unc_metric,
+                                        query_no_BA=True, fixed_cam=self.fixed_cam, stage=1, unc_metric=unc_metric,
                                         support_frame=len(video_tensor)-1, replace_ratio=0.2)
 
             self.progress.emit("Post-processing tracking results back to HD dimensions...")
@@ -648,6 +653,16 @@ class ProcessVideoTool(BaseTool):
         lbl_model_title = QLabel("<b>3. Model Tracking</b>")
         layout.addWidget(lbl_model_title)
         
+        # Model Selection
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Model Type:"))
+        self.combo_model = QComboBox()
+        self.combo_model.addItems(["SpatialTrackerV2-Online", "SpatialTrackerV2-Offline"])
+        self.combo_model.setCurrentText("SpatialTrackerV2-Online")
+        self.combo_model.currentTextChanged.connect(self._on_model_changed)
+        model_layout.addWidget(self.combo_model)
+        layout.addLayout(model_layout)
+        
         step_layout = QHBoxLayout()
         step_layout.addWidget(QLabel("VO Points:"))
         self.spin_vo = QSpinBox()
@@ -655,6 +670,29 @@ class ProcessVideoTool(BaseTool):
         self.spin_vo.setValue(120)
         step_layout.addWidget(self.spin_vo)
         layout.addLayout(step_layout)
+        
+        # Window Size (S_wind)
+        swind_layout = QHBoxLayout()
+        swind_layout.addWidget(QLabel("Window Size (S_wind):"))
+        self.spin_swind = QSpinBox()
+        self.spin_swind.setRange(5, 1000)
+        self.spin_swind.setValue(30)
+        swind_layout.addWidget(self.spin_swind)
+        layout.addLayout(swind_layout)
+        
+        # Overlap Size
+        overlap_layout = QHBoxLayout()
+        overlap_layout.addWidget(QLabel("Overlap Size:"))
+        self.spin_overlap = QSpinBox()
+        self.spin_overlap.setRange(0, 500)
+        self.spin_overlap.setValue(10)
+        overlap_layout.addWidget(self.spin_overlap)
+        layout.addLayout(overlap_layout)
+        
+        self.cb_fixed_cam = QCheckBox("Fixed Camera Pose")
+        self.cb_fixed_cam.setChecked(False)
+        self.cb_fixed_cam.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.cb_fixed_cam)
         
         self.btn_process = QPushButton("Run Point Tracking [process]")
         self.btn_process.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; padding: 6px;")
@@ -725,6 +763,14 @@ class ProcessVideoTool(BaseTool):
             except Exception:
                 pass
         self.overlay_items.clear()
+
+    def _on_model_changed(self, model_name):
+        if model_name == "SpatialTrackerV2-Online":
+            self.spin_swind.setValue(30)
+            self.spin_overlap.setValue(10)
+        else: # Offline
+            self.spin_swind.setValue(500)
+            self.spin_overlap.setValue(4)
 
     def get_point_color(self, pt_idx):
         """Generates a premium, highly-vibrant spatial color based on starting coordinates."""
@@ -925,50 +971,14 @@ class ProcessVideoTool(BaseTool):
             self.lbl_status.setText(f"Error: {e}")
 
     def _on_load_preprocess(self):
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "Load Preprocessed Metadata", "", "JSON Files (*_metadata.json)"
-        )
-        if not filename:
-            return
-            
+        from gui_preprocess_loader import load_preprocess_metadata
         try:
-            with open(filename, 'r') as f:
-                meta = json.load(f)
+            meta, filename = load_preprocess_metadata(self.main_window, self)
+            if not meta:
+                return
                 
-            video_path = meta.get("video_path")
-            npz_path = meta.get("npz_path")
-            
-            if not os.path.exists(video_path):
-                # Try relative dir resolution
-                meta_dir = os.path.dirname(filename)
-                rel_vid = os.path.join(meta_dir, os.path.basename(video_path))
-                if os.path.exists(rel_vid):
-                    video_path = rel_vid
-                else:
-                    raise FileNotFoundError(f"Associated video not found at: {video_path}")
-            
-            # Load video via main window if needed
-            if os.path.abspath(self.video_path) != os.path.abspath(video_path):
-                success = self.main_window.load_video(video_path)
-                if not success:
-                    raise RuntimeError("Failed to load associated video.")
-            
-            # Apply bounds
-            start = meta.get("start_frame", 0)
-            end = meta.get("end_frame", 0)
-            self.main_window.apply_timeline_restriction(start, end)
-            
-            # Sync TrimTool labels
-            from gui_tool_trim import TrimTool
-            for tool in self.main_window.tools:
-                if isinstance(tool, TrimTool):
-                    tool.start_frame = start
-                    tool.end_frame = end
-                    tool._update_labels()
-                    break
-                    
+            npz_path = meta.get("npz_path") or meta.get("preprocess_npz")
             self._apply_preprocess_paths(npz_path, filename)
-            
         except Exception as e:
             self.lbl_status.setText(f"Status: Preprocess load failed! {e}")
             self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
@@ -997,6 +1007,11 @@ class ProcessVideoTool(BaseTool):
 
         pts_map = getattr(self.main_window.decoder_thread, 'pts_map', [])
         
+        model_type = self.combo_model.currentText()
+        model_name = f"Yuxihenry/{model_type}"
+        s_wind = self.spin_swind.value()
+        overlap = min(self.spin_overlap.value(), s_wind - 1)
+
         self.thread = TrackingThread(
             video_path=self.video_path,
             start_frame=self.start_frame,
@@ -1005,7 +1020,11 @@ class ProcessVideoTool(BaseTool):
             npz_preprocess_path=self.preprocess_npz,
             points=self.points,
             vo_points=self.spin_vo.value(),
-            pts_map=pts_map
+            pts_map=pts_map,
+            fixed_cam=self.cb_fixed_cam.isChecked(),
+            model_name=model_name,
+            s_wind=s_wind,
+            overlap=overlap
         )
         self.thread.progress.connect(self._on_thread_status)
         self.thread.finished.connect(self._on_thread_finished)

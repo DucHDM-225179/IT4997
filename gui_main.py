@@ -6,7 +6,7 @@ from PyQt6.QtCore import Qt
 
 from gui_backend import VideoDecoderThread
 from gui_view import VideoGraphicsView
-from gui_tools import TrimTool, PreprocessTool, ProcessVideoTool
+from gui_tools import TrimTool, PreprocessTool, ProcessVideoTool, AddingObjectTool, AddingObject2DTool, VisualizeVideoTool
 
 
 class VideoEditorApp(QMainWindow):
@@ -99,10 +99,16 @@ class VideoEditorApp(QMainWindow):
         
         preprocess_tool = PreprocessTool(self)
         process_video_tool = ProcessVideoTool(self)
+        visualize_tool = VisualizeVideoTool(self)
+        adding_object_tool = AddingObjectTool(self)
+        adding_object_2d_tool = AddingObject2DTool(self)
         
         self.tools.append(trim_tool)
         self.tools.append(preprocess_tool)
         self.tools.append(process_video_tool)
+        self.tools.append(visualize_tool)
+        self.tools.append(adding_object_tool)
+        self.tools.append(adding_object_2d_tool)
 
         
         for tool in self.tools:
