@@ -168,13 +168,20 @@ class DPTHead(nn.Module):
                 chunk_output = self._forward_impl(
                     aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
                 )
-                all_preds.append(chunk_output)
+                if not self.training:
+                    all_preds.append(chunk_output.cpu())
+                else:
+                    all_preds.append(chunk_output)
             else:
                 chunk_preds, chunk_conf = self._forward_impl(
                     aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
                 )
-                all_preds.append(chunk_preds)
-                all_conf.append(chunk_conf)
+                if not self.training:
+                    all_preds.append(chunk_preds.cpu())
+                    all_conf.append(chunk_conf.cpu())
+                else:
+                    all_preds.append(chunk_preds)
+                    all_conf.append(chunk_conf)
 
         # Concatenate results along the sequence dimension
         if self.feature_only:
@@ -221,6 +228,10 @@ class DPTHead(nn.Module):
             # Select frames if processing a chunk
             if frames_start_idx is not None and frames_end_idx is not None:
                 x = x[:, frames_start_idx:frames_end_idx]
+
+            # If x is on CPU or has a different dtype, move and cast the slice!
+            if x.device != self.norm.weight.device or x.dtype != self.norm.weight.dtype:
+                x = x.to(device=self.norm.weight.device, dtype=self.norm.weight.dtype)
 
             x = x.view(B * S, -1, x.shape[-1])
 
@@ -269,7 +280,7 @@ class DPTHead(nn.Module):
         pos_embed = position_grid_to_embed(pos_embed, x.shape[1])
         pos_embed = pos_embed * ratio
         pos_embed = pos_embed.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
-        return x + pos_embed
+        return x + pos_embed.to(dtype=x.dtype)
 
     def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """

@@ -1,7 +1,7 @@
 import sys
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QSlider, QPushButton, QLabel, 
-                             QFileDialog, QComboBox, QStackedWidget)
+                             QFileDialog, QComboBox, QStackedWidget, QScrollArea, QFrame)
 from PyQt6.QtCore import Qt
 
 from gui_backend import VideoDecoderThread
@@ -48,9 +48,15 @@ class VideoEditorApp(QMainWindow):
         self.tool_selector = QComboBox()
         self.tool_stack = QStackedWidget()
         
+        # Wrap self.tool_stack in a scroll area to prevent pushing the window size
+        self.tool_scroll_area = QScrollArea()
+        self.tool_scroll_area.setWidgetResizable(True)
+        self.tool_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.tool_scroll_area.setWidget(self.tool_stack)
+        
         tools_layout.addWidget(QLabel("<b>Tools</b>"))
         tools_layout.addWidget(self.tool_selector)
-        tools_layout.addWidget(self.tool_stack)
+        tools_layout.addWidget(self.tool_scroll_area)
         
         tools_widget = QWidget()
         tools_widget.setLayout(tools_layout)
@@ -101,14 +107,14 @@ class VideoEditorApp(QMainWindow):
         process_video_tool = ProcessVideoTool(self)
         visualize_tool = VisualizeVideoTool(self)
         adding_object_tool = AddingObjectTool(self)
-        adding_object_2d_tool = AddingObject2DTool(self)
+        # adding_object_2d_tool = AddingObject2DTool(self)
         
         self.tools.append(trim_tool)
         self.tools.append(preprocess_tool)
         self.tools.append(process_video_tool)
         self.tools.append(visualize_tool)
         self.tools.append(adding_object_tool)
-        self.tools.append(adding_object_2d_tool)
+        # self.tools.append(adding_object_2d_tool)
 
         
         for tool in self.tools:

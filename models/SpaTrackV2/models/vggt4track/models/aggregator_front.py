@@ -261,7 +261,10 @@ class Aggregator(nn.Module):
             for i in range(len(frame_intermediates)):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+                if not self.training:
+                    output_list.append(concat_inter.cpu())
+                else:
+                    output_list.append(concat_inter)
 
         del concat_inter
         del frame_intermediates
@@ -286,7 +289,20 @@ class Aggregator(nn.Module):
             if self.training:
                 tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+                # Ensure block is on the correct device
+                block_device = next(self.frame_blocks[frame_idx].parameters()).device
+                if block_device != tokens.device:
+                    self.frame_blocks[frame_idx].to(tokens.device)
+
+                # Process in chunks of frames to save VRAM when not training
+                frame_chunk_size = 8
+                out_tokens_list = []
+                for i in range(0, B * S, frame_chunk_size):
+                    chunk_tokens = tokens[i : i + frame_chunk_size]
+                    chunk_pos = pos[i : i + frame_chunk_size] if pos is not None else None
+                    chunk_out = self.frame_blocks[frame_idx](chunk_tokens, pos=chunk_pos)
+                    out_tokens_list.append(chunk_out)
+                tokens = torch.cat(out_tokens_list, dim=0)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
@@ -309,6 +325,11 @@ class Aggregator(nn.Module):
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
+                # Ensure block is on the correct device
+                block_device = next(self.global_blocks[global_idx].parameters()).device
+                if block_device != tokens.device:
+                    self.global_blocks[global_idx].to(tokens.device)
+
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))

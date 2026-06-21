@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem
+from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem, QSizePolicy
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtGui import QPixmap, QImage, QPen, QBrush, QColor
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF
@@ -11,6 +11,9 @@ class VideoGraphicsView(QGraphicsView):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        
+        # Size Policy to prevent pushing the window size out
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         
         # Setup GPU acceleration
         self.setViewport(QOpenGLWidget())

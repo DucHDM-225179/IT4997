@@ -135,12 +135,13 @@ if __name__ == "__main__":
 
     print(f"Running Predictor...")
     with torch.no_grad():
+        extrs_in_c2w = np.linalg.inv(extrs_in).astype(np.float32)
         with torch.amp.autocast(device_type="cuda", dtype=dtype):
             (
                 c2w_traj, intrs, point_map, conf_depth,
                 track3d_pred, track2d_pred, vis_pred, conf_pred, video
             ) = model.forward(video_tensor, depth=depth_tensor,
-                                intrs=intrs_in, extrs=extrs_in, 
+                                intrs=intrs_in, extrs=extrs_in_c2w, 
                                 queries=query_xyt,
                                 fps=1, full_point=False, iters_track=4,
                                 query_no_BA=True, fixed_cam=False, stage=1, unc_metric=unc_metric,

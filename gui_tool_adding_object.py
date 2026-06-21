@@ -3,11 +3,16 @@ import os
 import json
 import numpy as np
 import trimesh
+import http.server
+import socketserver
+import threading
+import webbrowser
+import colorsys
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QSlider, 
                              QPushButton, QLabel, QFileDialog, QLineEdit, 
                              QMessageBox, QGroupBox, QGridLayout, QGraphicsView,
-                             QCheckBox)
+                             QCheckBox, QApplication)
 from PyQt6.QtCore import Qt, QPointF
 from PyQt6.QtGui import QColor, QBrush, QPen, QImage, QPixmap, QPainter, QPolygonF
 from PyQt6.QtWidgets import (QGraphicsEllipseItem, QGraphicsLineItem, 
@@ -15,6 +20,37 @@ from PyQt6.QtWidgets import (QGraphicsEllipseItem, QGraphicsLineItem,
 
 from gui_tool_base import BaseTool
 from gui_tool_mesh_transform import MeshTransformWidget
+
+class HTTPServerThread(threading.Thread):
+    def __init__(self, directory, port=8000):
+        super().__init__()
+        self.directory = directory
+        self.port = port
+        self.daemon = True
+        self.server = None
+
+    def run(self):
+        directory_to_serve = self.directory
+        class CustomHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=directory_to_serve, **kwargs)
+                
+        # Try to bind to port, if busy try next ports
+        for p in range(self.port, self.port + 100):
+            try:
+                self.server = socketserver.TCPServer(("127.0.0.1", p), CustomHandler)
+                self.port = p
+                print(f"Started visualizer local server at http://127.0.0.1:{p}")
+                break
+            except OSError:
+                continue
+        if self.server:
+            self.server.serve_forever()
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
 
 class AddingObjectTool(BaseTool):
     """Tool to load a 3D OBJ, constrain its position and rotation to tracked points, and render it."""
@@ -30,6 +66,8 @@ class AddingObjectTool(BaseTool):
         self.cached_centers = {}
         self.cached_rotations = {}
         self.last_coords_id = None
+        
+        self.server_thread = None
         
         self._init_ui()
         
@@ -49,6 +87,18 @@ class AddingObjectTool(BaseTool):
         self.mesh_widget.changed.connect(self.update_overlay)
         self.mesh_widget.mesh_loaded.connect(self._on_mesh_loaded)
         layout.addWidget(self.mesh_widget)
+        
+        # Checkbox to toggle 2D overlay in preview
+        self.chk_show_overlay = QCheckBox("Show 2D Overlay in Preview")
+        self.chk_show_overlay.setChecked(True)
+        self.chk_show_overlay.stateChanged.connect(self.update_overlay)
+        layout.addWidget(self.chk_show_overlay)
+        
+        # Button to open 3D visualizer
+        self.btn_open_3d_viz = QPushButton("Open 3D WebGL Visualizer")
+        self.btn_open_3d_viz.setStyleSheet("background-color: #9B59B6; color: white; font-weight: bold; padding: 8px; margin-top: 5px;")
+        self.btn_open_3d_viz.clicked.connect(self._on_open_3d_viz)
+        layout.addWidget(self.btn_open_3d_viz)
         
         # Status
         self.lbl_status = QLabel("Status: Ready. Please load point tracking results first.")
@@ -162,10 +212,10 @@ class AddingObjectTool(BaseTool):
         start_frame = getattr(process_tool, "start_frame", 0)
         step = getattr(process_tool, "step", 1)
         
-        U_prev = None
-        X_prev = None
-        
         try:
+            pts_ref = None
+            R_0 = None
+            
             for t in range(T):
                 w2c = extrinsics[t]
                 K = intrinsics[t]
@@ -191,45 +241,48 @@ class AddingObjectTool(BaseTool):
                 pts_cam_corr_hom = np.hstack([pts_cam_corr, np.ones((N, 1))])
                 pts_world_corr = (c2w @ pts_cam_corr_hom.T).T[:, :3]
                 
-                # 2. PCA calculation for orientation axes
+                # 2. Centered coordinates
                 center_t = np.mean(pts_world_corr, axis=0)
                 pts_centered = pts_world_corr - center_t
                 
-                cov = np.cov(pts_centered.T)
-                evals, evecs = np.linalg.eigh(cov)
-                
-                U_t = evecs[:, 0] # Minor variance = normal vector / up vector
-                X_t = evecs[:, 2] # Major variance = principal direction
-                
-                # 3. Handedness and Sign Correction
+                # 3. Handedness and Sign Correction using Kabsch relative rotation
                 if t == 0:
+                    cov = np.cov(pts_centered.T)
+                    evals, evecs = np.linalg.eigh(cov)
+                    
+                    U_0 = evecs[:, 0]  # Minor variance = normal vector / up vector
+                    X_0 = evecs[:, 2]  # Major variance = principal direction
+                    
                     P_cam_0 = c2w[:3, 3]
                     V_cam_0 = P_cam_0 - center_t
-                    if np.dot(U_t, V_cam_0) < 0:
-                        U_t = -U_t
-                    Y_t = np.cross(U_t, X_t)
+                    if np.dot(U_0, V_cam_0) < 0:
+                        U_0 = -U_0
                     
-                    U_t /= np.linalg.norm(U_t)
-                    X_t /= np.linalg.norm(X_t)
-                    Y_t /= np.linalg.norm(Y_t)
+                    # Ensure orthonormal basis
+                    U_0 /= np.linalg.norm(U_0)
+                    X_0 = X_0 - np.dot(X_0, U_0) * U_0
+                    X_0 /= np.linalg.norm(X_0)
+                    Y_0 = np.cross(U_0, X_0)
+                    Y_0 /= np.linalg.norm(Y_0)
                     
-                    R_t = np.stack([X_t, Y_t, U_t], axis=1)
-                    U_prev = U_t
-                    X_prev = X_t
+                    R_0 = np.stack([X_0, Y_0, U_0], axis=1)
+                    
+                    # Store reference points for relative alignment in subsequent frames
+                    pts_ref = pts_centered.copy()
+                    R_t = R_0
                 else:
-                    if np.dot(U_t, U_prev) < 0:
-                        U_t = -U_t
-                    if np.dot(X_t, X_prev) < 0:
-                        X_t = -X_t
-                    Y_t = np.cross(U_t, X_t)
+                    # Kabsch algorithm to find optimal relative rotation R_rel mapping pts_ref -> pts_centered
+                    H = pts_ref.T @ pts_centered
+                    U_svd, S_svd, Vt_svd = np.linalg.svd(H)
+                    V_svd = Vt_svd.T
                     
-                    U_t /= np.linalg.norm(U_t)
-                    X_t /= np.linalg.norm(X_t)
-                    Y_t /= np.linalg.norm(Y_t)
-                    
-                    R_t = np.stack([X_t, Y_t, U_t], axis=1)
-                    U_prev = U_t
-                    X_prev = X_t
+                    # Handle reflection / handedness
+                    det = np.linalg.det(V_svd @ U_svd.T)
+                    if det < 0:
+                        V_svd[:, 2] = -V_svd[:, 2]
+                        
+                    R_rel = V_svd @ U_svd.T
+                    R_t = R_rel.T @ R_0
                     
                 frame_idx = start_frame + t * step
                 self.cached_centers[frame_idx] = center_t
@@ -335,6 +388,9 @@ class AddingObjectTool(BaseTool):
         self._clear_overlay_items()
         
         if not self.video_path:
+            return
+            
+        if not self.chk_show_overlay.isChecked():
             return
             
         process_tool = self._get_process_tool()
@@ -505,3 +561,379 @@ class AddingObjectTool(BaseTool):
         k = int(np.floor(float_idx))
         ratio = float_idx - k
         return (1.0 - ratio) * arr[k] + ratio * arr[k + 1]
+
+    def _on_open_3d_viz(self):
+        if not self.video_path:
+            QMessageBox.warning(self, "Warning", "No video loaded!")
+            return
+            
+        process_tool = self._get_process_tool()
+        if not process_tool or process_tool.coords_3d is None:
+            QMessageBox.warning(self, "Warning", "Please run point tracking first and ensure tracking results are loaded.")
+            return
+            
+        preprocess_npz = getattr(process_tool, "preprocess_npz", "")
+        if not preprocess_npz or not os.path.exists(preprocess_npz):
+            QMessageBox.warning(self, "Warning", "Preprocessed depth maps not found. Please ensure preprocessing is done.")
+            return
+
+        self.lbl_status.setText("Status: Generating 3D point cloud & trajectories...")
+        self.lbl_status.setStyleSheet("color: #0078D7; font-weight: bold;")
+        QApplication.processEvents()
+        
+        # Start server if not running
+        if self.server_thread is None:
+            viz_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_viz")
+            if not os.path.exists(viz_dir):
+                viz_dir = os.path.abspath("_viz")
+            self.server_thread = HTTPServerThread(directory=viz_dir, port=8000)
+            self.server_thread.start()
+            import time
+            time.sleep(0.2)
+            
+        try:
+            filename = self._generate_viz_data(process_tool, preprocess_npz)
+            if filename:
+                port = self.server_thread.port
+                url = f"http://127.0.0.1:{port}/viz_template.html?data={filename}"
+                webbrowser.open(url)
+                self.lbl_status.setText("Status: 3D Visualizer opened in browser successfully.")
+                self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            else:
+                self.lbl_status.setText("Status: Failed to generate visualization data.")
+                self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to open visualizer: {e}")
+            self.lbl_status.setText("Status: Visualizer failed.")
+            self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
+
+    def _generate_viz_data(self, process_tool, preprocess_npz):
+        import zlib
+        import struct
+        import glob
+        import time
+        
+        viz_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_viz")
+        if not os.path.exists(viz_dir):
+            viz_dir = os.path.abspath("_viz")
+        os.makedirs(viz_dir, exist_ok=True)
+        
+        # Clean up old data_*.bin files
+        for old_file in glob.glob(os.path.join(viz_dir, "data_*.bin")):
+            try:
+                os.remove(old_file)
+            except Exception:
+                pass
+                
+        # Generate new filename
+        ts = int(time.time() * 1000)
+        filename = f"data_{ts}.bin"
+        bin_path = os.path.join(viz_dir, filename)
+        
+        # 1. Retrieve data
+        from gui_tool_process import get_video_dimensions
+        W_orig, H_orig = get_video_dimensions(self.video_path)
+        
+        # Calculate aspect-ratio preserving target size (max side 256)
+        aspect_ratio = W_orig / H_orig
+        if W_orig >= H_orig:
+            width_target = 256
+            height_target = int(round(256 / aspect_ratio))
+        else:
+            height_target = 256
+            width_target = int(round(256 * aspect_ratio))
+            
+        width_target = max(4, (width_target // 4) * 4)
+        height_target = max(4, (height_target // 4) * 4)
+        fixed_size = (width_target, height_target)
+        
+        extrinsics = process_tool.robust_squeeze_tracks(process_tool.tracking_results.get("extrinsics"))
+        intrinsics = process_tool.robust_squeeze_tracks(process_tool.tracking_results.get("intrinsics"))
+        trajs = process_tool.coords_3d
+        visibs = process_tool.visibs
+        confs = process_tool.tracking_results.get("unc_metric")
+        
+        T = trajs.shape[0]
+        start_frame = process_tool.start_frame
+        step = process_tool.step
+        
+        # 2. Decode Video Frames using PyAV with pts_map synchronization
+        import av
+        pts_map = getattr(self.main_window.decoder_thread, 'pts_map', [])
+        
+        frame_indices = [start_frame + t * step for t in range(T)]
+        rgb_video = []
+        
+        try:
+            container = av.open(self.video_path, container_options={'ignore_editlist': '1'})
+            video_stream = container.streams.video[0]
+            video_stream.thread_type = "AUTO"
+            
+            # Fast seek if pts_map is available
+            if pts_map and start_frame < len(pts_map):
+                container.seek(pts_map[start_frame], stream=video_stream, backward=True)
+                
+            count = 0
+            for frame in container.decode(video=0):
+                if frame.pts is None:
+                    continue
+                try:
+                    idx = pts_map.index(frame.pts) if pts_map else count
+                except ValueError:
+                    continue
+                    
+                if idx < start_frame:
+                    continue
+                if idx > frame_indices[-1]:
+                    break
+                    
+                if (idx - start_frame) % step == 0:
+                    img = frame.to_rgb().to_ndarray()
+                    rgb_video.append(img)
+                    count += 1
+                    if len(rgb_video) >= T:
+                        break
+            container.close()
+        except Exception as e:
+            print(f"PyAV synchronized decode failed: {e}. Falling back to basic decord/cv2.")
+            rgb_video = []
+            try:
+                import decord
+                vr = decord.VideoReader(self.video_path)
+                frames = vr.get_batch(frame_indices).asnumpy()
+                for t in range(T):
+                    rgb_video.append(frames[t])
+            except Exception as e2:
+                print(f"Decord failed, trying OpenCV fallback: {e2}")
+                import cv2
+                cap = cv2.VideoCapture(self.video_path)
+                for idx in frame_indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = cap.read()
+                    if not ret:
+                        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+                        frame = np.zeros((h, w, 3), dtype=np.uint8)
+                    else:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    rgb_video.append(frame)
+                cap.release()
+
+        while len(rgb_video) < T:
+            if len(rgb_video) > 0:
+                rgb_video.append(rgb_video[-1])
+            else:
+                rgb_video.append(np.zeros((H_orig, W_orig, 3), dtype=np.uint8))
+        rgb_video = rgb_video[:T]
+            
+        import cv2
+        rgb_video_resized = np.stack([cv2.resize(f, fixed_size, interpolation=cv2.INTER_AREA) for f in rgb_video])
+        
+        # 3. Load and Resize Depth Maps (Refined or Preprocessed)
+        has_refined_depth = (process_tool.tracking_results is not None and "depths" in process_tool.tracking_results)
+        
+        if has_refined_depth:
+            all_depths = process_tool.tracking_results["depths"]
+            uncs = process_tool.tracking_results.get("unc_metric", None)
+            prep_data = {} # not used, since we have refined data
+        else:
+            prep_data = np.load(preprocess_npz, allow_pickle=True)
+            all_depths = prep_data["depths"]
+            uncs = prep_data.get("unc_metric", None)
+            
+        depth_video = []
+        for t in range(T):
+            if t < len(all_depths):
+                depth_video.append(all_depths[t])
+            else:
+                depth_video.append(all_depths[-1] if len(all_depths) > 0 else np.zeros((fixed_size[1], fixed_size[0]), dtype=np.float32))
+                
+        depth_video_resized = np.stack([cv2.resize(d, fixed_size, interpolation=cv2.INTER_NEAREST) for d in depth_video])
+        
+        # Apply uncertainty mask if present
+        if uncs is not None:
+            for t in range(min(T, len(uncs))):
+                unc_frame = uncs[t]
+                if unc_frame.dtype == bool:
+                    mask = unc_frame
+                else:
+                    mask = unc_frame < 0.5
+                # Resize mask to fixed size
+                mask_resized = cv2.resize(mask.astype(np.uint8), fixed_size, interpolation=cv2.INTER_NEAREST) > 0
+                depth_video_resized[t][mask_resized] = 0.0
+                
+        # 4. Normalize trajectory and camera relative to first frame (tapip3d style)
+        first_frame_inv = np.linalg.inv(extrinsics[0])
+        normalized_extrinsics = np.array([first_frame_inv @ ext for ext in extrinsics])
+        
+        N = trajs.shape[1]
+        normalized_trajs = np.zeros_like(trajs)
+        for t in range(T):
+            pts_hom = np.hstack([trajs[t], np.ones((N, 1))])
+            pts_normalized = (first_frame_inv @ pts_hom.T).T
+            normalized_trajs[t] = pts_normalized[:, :3]
+            
+        # Scale intrinsics to match resized resolution
+        scale_x = fixed_size[0] / W_orig
+        scale_y = fixed_size[1] / H_orig
+        
+        scaled_intrinsics = intrinsics.copy()
+        scaled_intrinsics[:, 0, :] *= scale_x
+        scaled_intrinsics[:, 1, :] *= scale_y
+        
+        # Calculate FOV info
+        fx = intrinsics[0, 0, 0]
+        fy = intrinsics[0, 1, 1]
+        fov_y = 2 * np.arctan(H_orig / (2 * fy)) * (180 / np.pi)
+        fov_x = 2 * np.arctan(W_orig / (2 * fx)) * (180 / np.pi)
+        original_aspect_ratio = (W_orig / fx) / (H_orig / fy)
+        
+        # 5. Encode 16-bit depth maps
+        min_depth = float(depth_video_resized.min()) * 0.8
+        max_depth = float(depth_video_resized.max()) * 1.5
+        if max_depth == min_depth:
+            max_depth += 1e-5
+            
+        depth_normalized = (depth_video_resized - min_depth) / (max_depth - min_depth)
+        depth_normalized = np.clip(depth_normalized, 0.0, 1.0)
+        depth_int = (depth_normalized * ((1 << 16) - 1)).astype(np.uint16)
+        
+        depths_rgb = np.zeros((T, fixed_size[1], fixed_size[0], 3), dtype=np.uint8)
+        depths_rgb[:, :, :, 0] = (depth_int & 0xFF).astype(np.uint8)
+        depths_rgb[:, :, :, 1] = ((depth_int >> 8) & 0xFF).astype(np.uint8)
+        
+        # 6. Precompute mesh vertices, faces, and dynamic transform matrices
+        mesh = self.mesh_widget.get_mesh()
+        mesh_vertices = np.zeros((0, 3), dtype=np.float32)
+        mesh_faces = np.zeros((0, 3), dtype=np.int32)
+        mesh_vertex_colors = np.zeros((0, 3), dtype=np.float32)
+        mesh_centers = np.zeros((T, 3), dtype=np.float32)
+        mesh_rotations = np.zeros((T, 3, 3), dtype=np.float32)
+        
+        if mesh is not None:
+            mesh_vertices = mesh.vertices.astype(np.float32)
+            mesh_faces = mesh.faces.astype(np.int32)
+            
+            # Compute vertex colors based on centroid distance
+            vertex_dists = np.linalg.norm(mesh_vertices, axis=1)
+            min_d = vertex_dists.min() if len(vertex_dists) > 0 else 0.0
+            max_d = vertex_dists.max() if len(vertex_dists) > 0 else 1.0
+            if max_d == min_d:
+                max_d += 1e-5
+                
+            mesh_vertex_colors_list = []
+            for d in vertex_dists:
+                t_color = (d - min_d) / (max_d - min_d)
+                t_color = np.clip(t_color, 0.0, 1.0)
+                hue = (240 - 240 * t_color) / 360.0
+                r, g, b = colorsys.hls_to_rgb(hue, 0.5, 0.8)
+                mesh_vertex_colors_list.append([r, g, b])
+            mesh_vertex_colors = np.array(mesh_vertex_colors_list, dtype=np.float32)
+            
+            # Precompute Kabsch center and rotation per frame using normalized_trajs
+            pts_ref = None
+            R_0 = None
+            
+            for t in range(T):
+                pts_3d_t = normalized_trajs[t]
+                center_t = np.mean(pts_3d_t, axis=0)
+                pts_centered = pts_3d_t - center_t
+                
+                if t == 0:
+                    cov = np.cov(pts_centered.T)
+                    evals, evecs = np.linalg.eigh(cov)
+                    
+                    U_0 = evecs[:, 0]
+                    X_0 = evecs[:, 2]
+                    
+                    c2w_norm_0 = np.linalg.inv(normalized_extrinsics[0])
+                    P_cam_0 = c2w_norm_0[:3, 3]
+                    V_cam_0 = P_cam_0 - center_t
+                    if np.dot(U_0, V_cam_0) < 0:
+                        U_0 = -U_0
+                        
+                    U_0 /= np.linalg.norm(U_0)
+                    X_0 = X_0 - np.dot(X_0, U_0) * U_0
+                    X_0 /= np.linalg.norm(X_0)
+                    Y_0 = np.cross(U_0, X_0)
+                    Y_0 /= np.linalg.norm(Y_0)
+                    
+                    R_0 = np.stack([X_0, Y_0, U_0], axis=1)
+                    pts_ref = pts_centered.copy()
+                    R_t = R_0
+                else:
+                    H = pts_ref.T @ pts_centered
+                    U_svd, S_svd, Vt_svd = np.linalg.svd(H)
+                    V_svd = Vt_svd.T
+                    
+                    det = np.linalg.det(V_svd @ U_svd.T)
+                    if det < 0:
+                        V_svd[:, 2] = -V_svd[:, 2]
+                        
+                    R_rel = V_svd @ U_svd.T
+                    R_t = R_rel.T @ R_0
+                    
+                mesh_centers[t] = center_t
+                mesh_rotations[t] = R_t
+                
+        # 7. Package and Compress
+        arrays = {
+            "rgb_video": rgb_video_resized,
+            "depths_rgb": depths_rgb,
+            "intrinsics": scaled_intrinsics,
+            "extrinsics": normalized_extrinsics,
+            "inv_extrinsics": np.linalg.inv(normalized_extrinsics),
+            "trajectories": normalized_trajs.astype(np.float32),
+            "cameraZ": np.array(0.0, dtype=np.float32),
+            "visibs": visibs if visibs is not None else None,
+            "confs": confs if confs is not None else None,
+            "mesh_vertices": mesh_vertices,
+            "mesh_faces": mesh_faces,
+            "mesh_vertex_colors": mesh_vertex_colors,
+            "mesh_centers": mesh_centers,
+            "mesh_rotations": mesh_rotations
+        }
+        
+        header = {}
+        blob_parts = []
+        offset = 0
+        for key, arr in arrays.items():
+            if arr is not None:
+                arr = np.ascontiguousarray(arr)
+                arr_bytes = arr.tobytes()
+                header[key] = {
+                    "dtype": str(arr.dtype),
+                    "shape": arr.shape,
+                    "offset": offset,
+                    "length": len(arr_bytes)
+                }
+                blob_parts.append(arr_bytes)
+                offset += len(arr_bytes)
+                
+        raw_blob = b"".join(blob_parts)
+        compressed_blob = zlib.compress(raw_blob, level=9)
+        
+        header["meta"] = {
+            "depthRange": [min_depth, max_depth],
+            "totalFrames": int(T),
+            "resolution": fixed_size,
+            "baseFrameRate": 4,
+            "numTrajectoryPoints": normalized_trajs.shape[1],
+            "fov": float(fov_y),
+            "fov_x": float(fov_x),
+            "original_aspect_ratio": float(original_aspect_ratio),
+            "fixed_aspect_ratio": float(fixed_size[0]/fixed_size[1]),
+            "mesh_scale": self.mesh_widget.get_scale() if mesh is not None else 1.0,
+            "mesh_offset": self.mesh_widget.get_offset().tolist() if mesh is not None else [0.0, 0.0, 0.0],
+            "mesh_rotation": [self.mesh_widget.sld_yaw.value(), self.mesh_widget.sld_pitch.value(), self.mesh_widget.sld_roll.value()] if mesh is not None else [0.0, 0.0, 0.0]
+        }
+        
+        header_bytes = json.dumps(header).encode("utf-8")
+        header_len = struct.pack("<I", len(header_bytes))
+        
+        with open(bin_path, "wb") as f:
+            f.write(header_len)
+            f.write(header_bytes)
+            f.write(compressed_blob)
+            
+        return filename

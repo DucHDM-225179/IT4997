@@ -155,7 +155,22 @@ class VisualizeVideoTool(BaseTool):
         if not npz_path or not os.path.exists(npz_path):
             return False
             
-        # Try to resolve companion json path if not provided
+        start_frame = 0
+        end_frame = 0
+        step = 1
+        
+        is_result_npz = False
+        original_npz_path = npz_path
+        
+        # Check if the file is a results NPZ directly and see if we can load it
+        try:
+            temp_data = np.load(npz_path, allow_pickle=True)
+            if "depths" in temp_data:
+                is_result_npz = True
+        except Exception:
+            pass
+            
+        # Try to resolve companion json path
         if not json_path:
             if npz_path.endswith("_intermediate.npz"):
                 json_path = npz_path.replace("_intermediate.npz", "_metadata.json")
@@ -164,10 +179,6 @@ class VisualizeVideoTool(BaseTool):
             else:
                 json_path = os.path.splitext(npz_path)[0] + ".json"
                 
-        start_frame = 0
-        end_frame = 0
-        step = 1
-        
         if json_path and os.path.exists(json_path):
             try:
                 with open(json_path, 'r') as f:
@@ -176,8 +187,8 @@ class VisualizeVideoTool(BaseTool):
                 end_frame = meta.get("end_frame", 0)
                 step = meta.get("step", 1)
                 
-                # If this is result metadata, redirect to the preprocessed intermediate NPZ
-                if "preprocess_npz" in meta:
+                # If this is result metadata and we don't have depths directly, redirect to the preprocessed intermediate NPZ
+                if not is_result_npz and "preprocess_npz" in meta:
                     prep_npz = meta["preprocess_npz"]
                     if os.path.exists(prep_npz):
                         npz_path = prep_npz
@@ -187,6 +198,9 @@ class VisualizeVideoTool(BaseTool):
         try:
             data = np.load(npz_path, allow_pickle=True)
             if "depths" not in data:
+                data = np.load(original_npz_path, allow_pickle=True)
+                
+            if "depths" not in data:
                 return False
                 
             self.depths = data["depths"]
@@ -194,7 +208,9 @@ class VisualizeVideoTool(BaseTool):
             self.start_frame = start_frame
             self.end_frame = end_frame
             self.step = step
-            self.loaded_npz_path = npz_path
+            
+            # Use original_npz_path if it had depths directly, otherwise use npz_path
+            self.loaded_npz_path = original_npz_path if is_result_npz else npz_path
             return True
         except Exception as e:
             print(f"Error loading npz file: {e}")
@@ -235,6 +251,12 @@ class VisualizeVideoTool(BaseTool):
                     frame[mask] = 0.0
                 except Exception:
                     pass
+                    
+            # Resize depth frame to match the original video dimensions on the fly
+            meta = self.main_window.decoder_thread.get_metadata()
+            w_target, h_target = meta.get("width", 0), meta.get("height", 0)
+            if w_target > 0 and h_target > 0:
+                frame = cv2.resize(frame, (w_target, h_target), interpolation=cv2.INTER_NEAREST)
                     
             # Define invalid pixels
             invalid_mask = frame <= 0.01

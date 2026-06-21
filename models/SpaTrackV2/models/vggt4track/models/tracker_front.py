@@ -88,7 +88,10 @@ class FrontTracker(nn.Module, PyTorchModelHubMixin):
         enhanced_features = []
         for layer_i, layer in enumerate(self.intermediate_layers):
             # patch_feat_i = features[layer_i][0] + self.residual_proj[layer_i](aggregated_tokens_list[layer][:,:,patch_start_idx:,:].view(B*T, features[layer_i][0].shape[1], -1))
-            patch_feat_i = self.residual_proj[layer_i](aggregated_tokens_list[layer][:,:,patch_start_idx:,:].view(B*T, features[layer_i][0].shape[1], -1))
+            feat_slice = aggregated_tokens_list[layer][:, :, patch_start_idx:, :]
+            if feat_slice.device != self.residual_proj[layer_i].weight.device:
+                feat_slice = feat_slice.to(self.residual_proj[layer_i].weight.device)
+            patch_feat_i = self.residual_proj[layer_i](feat_slice.view(B*T, features[layer_i][0].shape[1], -1))
             enhance_i = (patch_feat_i, features[layer_i][1])
             enhanced_features.append(enhance_i)
 

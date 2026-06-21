@@ -1,64 +1,192 @@
 import os
 import json
-from PyQt6.QtWidgets import QFileDialog
-from gui_tool_trim import TrimTool
+from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+def gui_tool_load_video(main_window, parent_widget, video_path, json_path=None):
+    """
+    Universal video loader that resolves absolute or relative video paths.
+    If the video file is not found, prompts the user to locate it.
+    If a new video is loaded, loads it into the main_window.
+    """
+    if not video_path:
+        QMessageBox.critical(parent_widget, "Error", "No video path specified.")
+        return None
+
+    resolved_path = os.path.abspath(video_path)
+    
+    if not os.path.exists(resolved_path):
+        # Try resolving relative to the JSON file directory
+        if json_path:
+            json_dir = os.path.dirname(os.path.abspath(json_path))
+            rel_path = os.path.join(json_dir, os.path.basename(video_path))
+            if os.path.exists(rel_path):
+                resolved_path = os.path.abspath(rel_path)
+        
+        # If still not found, prompt the user to browse for the video file
+        if not os.path.exists(resolved_path):
+            browse_dir = os.path.dirname(json_path) if json_path else ""
+            selected_path, _ = QFileDialog.getOpenFileName(
+                parent_widget,
+                f"Locate Video File ({os.path.basename(video_path)})",
+                browse_dir,
+                "Video Files (*.mp4 *.avi *.mkv *.mov)"
+            )
+            if selected_path:
+                resolved_path = os.path.abspath(selected_path)
+            else:
+                QMessageBox.critical(
+                    parent_widget,
+                    "Error",
+                    f"Associated video file '{os.path.basename(video_path)}' could not be found."
+                )
+                return None
+
+    # Load video into main window if it's different from the currently loaded video
+    current_video = getattr(main_window, 'current_video_path', '')
+    if not current_video or os.path.abspath(current_video) != resolved_path:
+        success = main_window.load_video(resolved_path)
+        if not success:
+            QMessageBox.critical(
+                parent_widget,
+                "Error",
+                f"Failed to load video file: {resolved_path}"
+            )
+            return None
+
+    return resolved_path
 
 def load_preprocess_metadata(main_window, parent_widget, filename=None):
     """
-    Loads preprocessed metadata, updates the video in main_window,
-    restricts the timeline slider, and updates TrimTool bounds.
-    If filename is not provided, prompts the user via a file dialog.
-    
-    Returns:
-        tuple: (metadata_dict, metadata_filename) if successful, (None, None) if cancelled.
+    Universal loader for preprocessing metadata JSON.
     """
     if not filename:
         filename, _ = QFileDialog.getOpenFileName(
-            parent_widget, "Load Preprocessed Metadata", "", "JSON Files (*.json *_metadata.json)"
+            parent_widget,
+            "Load Preprocess Metadata",
+            "",
+            "JSON Files (*_metadata.json *.json)"
         )
-    if not filename:
-        return None, None
-        
+        if not filename:
+            return None, None
+
+    filename = os.path.abspath(filename)
     try:
         with open(filename, 'r') as f:
             meta = json.load(f)
-            
-        video_path = meta.get("video_path")
-        npz_path = meta.get("npz_path") or meta.get("preprocess_npz")
-        start = meta.get("start_frame", 0)
-        end = meta.get("end_frame", 0)
-        step = meta.get("step", 1)
-        
-        if not video_path:
-            raise ValueError("No video_path found in metadata JSON.")
-            
-        if not os.path.exists(video_path):
-            # Try relative path resolution based on metadata file's folder
-            meta_dir = os.path.dirname(filename)
-            rel_vid = os.path.join(meta_dir, os.path.basename(video_path))
-            if os.path.exists(rel_vid):
-                video_path = rel_vid
-            else:
-                raise FileNotFoundError(f"Associated video not found at: {video_path}")
-                
-        # Load video via main window if not already loaded
-        current_vid = getattr(main_window, 'current_video_path', '')
-        if not current_vid or os.path.abspath(current_vid) != os.path.abspath(video_path):
-            success = main_window.load_video(video_path)
-            if not success:
-                raise RuntimeError("Failed to load associated video.")
-                
-        # Apply trim restrictions to timeline
-        main_window.apply_timeline_restriction(start, end)
-        
-        # Sync TrimTool labels
-        for tool in main_window.tools:
-            if isinstance(tool, TrimTool):
-                tool.start_frame = start
-                tool.end_frame = end
-                tool._update_labels()
-                break
-                
-        return meta, filename
     except Exception as e:
-        raise e
+        QMessageBox.critical(parent_widget, "Error", f"Failed to parse JSON file:\n{e}")
+        return None, None
+
+    # Resolve video path
+    video_path = meta.get("video_path")
+    resolved_video_path = gui_tool_load_video(main_window, parent_widget, video_path, filename)
+    if not resolved_video_path:
+        return None, None
+    meta["video_path"] = resolved_video_path
+
+    # Resolve NPZ path
+    npz_path = meta.get("npz_path") or meta.get("preprocess_npz")
+    if npz_path:
+        resolved_npz = os.path.abspath(npz_path)
+        if not os.path.exists(resolved_npz):
+            # Try relative to the JSON metadata file
+            rel_npz = os.path.join(os.path.dirname(filename), os.path.basename(npz_path))
+            if os.path.exists(rel_npz):
+                resolved_npz = os.path.abspath(rel_npz)
+        
+        # Update NPZ path in metadata dict
+        if "npz_path" in meta:
+            meta["npz_path"] = resolved_npz
+        if "preprocess_npz" in meta:
+            meta["preprocess_npz"] = resolved_npz
+            
+        if not os.path.exists(resolved_npz):
+            QMessageBox.warning(
+                parent_widget,
+                "Missing Preprocessed Data",
+                f"The preprocessed NPZ file was not found at:\n{resolved_npz}\n\n"
+                "Please run preprocessing again to generate it."
+            )
+
+    return meta, filename
+
+def load_tracking_result(main_window, parent_widget, filename=None):
+    """
+    Universal loader for tracking session / result metadata JSON.
+    """
+    if not filename:
+        filename, _ = QFileDialog.getOpenFileName(
+            parent_widget,
+            "Load Tracking Session",
+            "",
+            "JSON Files (*_result_metadata.json *.json)"
+        )
+        if not filename:
+            return None, None
+
+    filename = os.path.abspath(filename)
+    try:
+        with open(filename, 'r') as f:
+            meta = json.load(f)
+    except Exception as e:
+        QMessageBox.critical(parent_widget, "Error", f"Failed to parse JSON file:\n{e}")
+        return None, None
+
+    # Resolve video path
+    video_path = meta.get("video_path")
+    resolved_video_path = gui_tool_load_video(main_window, parent_widget, video_path, filename)
+    if not resolved_video_path:
+        return None, None
+    meta["video_path"] = resolved_video_path
+
+    # Resolve preprocess and tracking result paths
+    preprocess_npz = meta.get("preprocess_npz")
+    preprocess_json = meta.get("preprocess_json")
+    result_npz = meta.get("result_npz")
+    json_dir = os.path.dirname(filename)
+
+    # 1. Resolve preprocess NPZ
+    if preprocess_npz:
+        resolved_prep_npz = os.path.abspath(preprocess_npz)
+        if not os.path.exists(resolved_prep_npz):
+            rel_prep_npz = os.path.join(json_dir, os.path.basename(preprocess_npz))
+            if os.path.exists(rel_prep_npz):
+                resolved_prep_npz = os.path.abspath(rel_prep_npz)
+        meta["preprocess_npz"] = resolved_prep_npz
+
+    # 2. Resolve preprocess JSON
+    if preprocess_json:
+        resolved_prep_json = os.path.abspath(preprocess_json)
+        if not os.path.exists(resolved_prep_json):
+            rel_prep_json = os.path.join(json_dir, os.path.basename(preprocess_json))
+            if os.path.exists(rel_prep_json):
+                resolved_prep_json = os.path.abspath(rel_prep_json)
+        meta["preprocess_json"] = resolved_prep_json
+
+    # 3. Resolve result NPZ
+    if result_npz:
+        resolved_res_npz = os.path.abspath(result_npz)
+        if not os.path.exists(resolved_res_npz):
+            rel_res_npz = os.path.join(json_dir, os.path.basename(result_npz))
+            if os.path.exists(rel_res_npz):
+                resolved_res_npz = os.path.abspath(rel_res_npz)
+        meta["result_npz"] = resolved_res_npz
+
+    # Check for missing files and notify
+    missing = []
+    if not meta.get("preprocess_npz") or not os.path.exists(meta["preprocess_npz"]):
+        missing.append("Preprocessed NPZ file")
+    if not meta.get("preprocess_json") or not os.path.exists(meta["preprocess_json"]):
+        missing.append("Preprocessed metadata JSON file")
+    if not meta.get("result_npz") or not os.path.exists(meta["result_npz"]):
+        missing.append("Tracking results NPZ file")
+
+    if missing:
+        QMessageBox.warning(
+            parent_widget,
+            "Incomplete Session Data",
+            "The following associated data files were not found and might need update/regeneration:\n" +
+            "\n".join(f"- {item}" for item in missing)
+        )
+
+    return meta, filename

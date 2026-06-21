@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import av
 import numpy as np
-from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSpinBox, QWidget
+from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QSpinBox, QWidget, QComboBox
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from gui_tool_base import BaseTool
@@ -19,7 +19,7 @@ class PreprocessingThread(QThread):
     status = pyqtSignal(str) # Status messages
     finished = pyqtSignal(bool, str) # (success, saved_file_path or error_message)
 
-    def __init__(self, video_path, start_frame, end_frame, step, npz_path, json_path, pts_map=None):
+    def __init__(self, video_path, start_frame, end_frame, step, npz_path, json_path, pts_map=None, chunk_size=24, overlap=12, target_size=336):
         super().__init__()
         self.video_path = video_path
         self.start_frame = start_frame
@@ -28,6 +28,9 @@ class PreprocessingThread(QThread):
         self.npz_path = npz_path
         self.json_path = json_path
         self.pts_map = pts_map or []
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.target_size = target_size
 
     def run(self):
         try:
@@ -35,7 +38,19 @@ class PreprocessingThread(QThread):
             container = av.open(self.video_path, container_options={'ignore_editlist': '1'})
             video_stream = container.streams.video[0]
             video_stream.thread_type = "AUTO" # Enable multi-threaded decoding
-            H_orig, W_orig = video_stream.height, video_stream.width
+            
+            # Decode the first frame to get the true frame dimensions (compensating for any padding/macroblock align)
+            H_orig, W_orig = None, None
+            for frame in container.decode(video=0):
+                img_temp = frame.to_ndarray(format='rgb24')
+                H_orig, W_orig = img_temp.shape[:2]
+                break
+            
+            if H_orig is None or W_orig is None:
+                H_orig, W_orig = video_stream.height, video_stream.width
+                
+            # Seek back to beginning
+            container.seek(0, backward=True)
             
             # Determine number of frames to decode
             total_frames_to_decode = 0
@@ -73,7 +88,7 @@ class PreprocessingThread(QThread):
                 if (idx - self.start_frame) % self.step == 0:
                     img = frame.to_ndarray(format='rgb24') # Optimized C conversion (extremely fast!)
                     img_tensor = torch.from_numpy(img).permute(2, 0, 1).float()
-                    img_proc = preprocess_image(img_tensor)
+                    img_proc = preprocess_image(img_tensor, target_size=self.target_size)
                     frames.append(img_proc)
                     count += 1
                     self.progress.emit(count, total_frames_to_decode)
@@ -94,178 +109,52 @@ class PreprocessingThread(QThread):
             
             vggt4track_model = VGGT4Track.from_pretrained("Yuxihenry/SpatialTrackerV2_Front")
             vggt4track_model.eval()
-            vggt4track_model = vggt4track_model.to("cuda")
+            vggt4track_model = vggt4track_model.to(device="cuda", dtype=dtype)
             
-            self.status.emit("Running model inference (chunked/sliding-window)...")
-            from models.SpaTrackV2.models.utils import matrix_to_quaternion, quaternion_to_matrix
-
-            chunk_size = 8
-            overlap = 4
+            self.status.emit("Running model inference in a single pass...")
             num_frames = video_tensor.shape[0]
 
-            final_depths = torch.zeros((num_frames, H_orig, W_orig), device="cpu", dtype=torch.float32)
-            final_uncs = torch.zeros((num_frames, H_orig, W_orig), device="cpu", dtype=torch.float32)
+            H_proc, W_proc = video_tensor.shape[-2:]
+            final_depths = torch.zeros((num_frames, H_proc, W_proc), device="cpu", dtype=torch.float32)
+            final_uncs = torch.zeros((num_frames, H_proc, W_proc), device="cpu", dtype=torch.float32)
             final_intrs = torch.zeros((num_frames, 3, 3), device="cpu", dtype=torch.float32)
             final_extrs = torch.zeros((num_frames, 4, 4), device="cpu", dtype=torch.float32)
 
-            start_idx = 0
-            is_first_chunk = True
-
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-                while start_idx < num_frames:
-                    end_idx = min(start_idx + chunk_size, num_frames)
-                    if not is_first_chunk:
-                        chunk_start = start_idx - overlap
-                    else:
-                        chunk_start = start_idx
-                        
-                    chunk_video = video_tensor[chunk_start:end_idx]
-                    self.status.emit(f"Running model inference: frame {end_idx}/{num_frames}...")
-                    
-                    with torch.no_grad():
-                        with torch.amp.autocast(device_type="cuda", dtype=dtype):
-                            predictions = vggt4track_model(chunk_video[None].cuda() / 255.0)
-                            
-                            extrinsic = predictions["poses_pred"][0].cuda()  # [W_s, 4, 4]
-                            intrinsic = predictions["intrs"][0]       # [W_s, 3, 3]
-                            depth_map = predictions["points_map"][..., 2]  # [W_s, H, W]
-                            depth_conf = predictions["unc_metric"]         # [W_s, H, W]
-                            
-                            # Post-processing: Resize back to original resolution
-                            H_proc, W_proc = chunk_video.shape[-2:]
-                            depth_tensor_hd = F.interpolate(depth_map[:, None], size=(H_orig, W_orig), mode='bilinear', align_corners=True).squeeze(1)
-                            unc_metric_hd = F.interpolate(depth_conf[:, None], size=(H_orig, W_orig), mode='bilinear', align_corners=True).squeeze(1)
-                            
-                            # Scale intrinsics back to original resolution
-                            intrs_hd = intrinsic.clone()
-                            intrs_hd[..., 0, :] *= W_orig / W_proc
-                            intrs_hd[..., 1, :] *= H_orig / H_proc
-                            
-                    extrinsic = extrinsic.float()
-                    intrs_hd = intrs_hd.float()
-                    depth_tensor_hd = depth_tensor_hd.float()
-                    unc_metric_hd = unc_metric_hd.float()
-                    
-                    chunk_len = len(chunk_video)
-                    
-                    if is_first_chunk:
-                        final_depths[0:chunk_len] = depth_tensor_hd.cpu()
-                        final_uncs[0:chunk_len] = unc_metric_hd.cpu()
-                        final_intrs[0:chunk_len] = intrs_hd.cpu()
-                        final_extrs[0:chunk_len] = extrinsic.cpu()
-                        is_first_chunk = False
-                        start_idx += chunk_size
-                    else:
-                        # 1. Compute scale factor s from overlapping depths
-                        D_prev = final_depths[chunk_start : chunk_start + overlap].cuda()
-                        D_curr = depth_tensor_hd[:overlap]
-                        
-                        valid_mask = (D_prev > 0.1) & (D_prev < 100.0) & (D_curr > 0.1) & (D_curr < 100.0)
-                        if valid_mask.sum() > 100:
-                            X = D_curr[valid_mask]
-                            Y = D_prev[valid_mask]
-                            sum_xx = (X * X).sum()
-                            if sum_xx > 1e-6:
-                                s = (X * Y).sum() / sum_xx
-                                s = torch.clamp(s, min=0.2, max=5.0)
-                            else:
-                                s = torch.tensor(1.0, device="cuda")
-                        else:
-                            s = torch.tensor(1.0, device="cuda")
-                        
-                        # 2. Scale the current chunk's depth and camera translations
-                        depth_tensor_hd = s * depth_tensor_hd
-                        extrinsic = extrinsic.clone()
-                        extrinsic[:, :3, 3] = s * extrinsic[:, :3, 3]
+                with torch.no_grad():
+                    with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                        predictions = vggt4track_model(video_tensor[None].cuda() / 255.0)
 
-                        M_trans = []
-                        M_quats = []
-                        
-                        prev_global_extrs = final_extrs[chunk_start : chunk_start + overlap].cuda()
-                        
-                        for t in range(overlap):
-                            G_t = prev_global_extrs[t]
-                            C_t = extrinsic[t]
-                            M_t = G_t @ torch.inverse(C_t)
-                            M_trans.append(M_t[:3, 3])
-                            q_t = matrix_to_quaternion(M_t[:3, :3])
-                            M_quats.append(q_t)
-                            
-                        M_trans = torch.stack(M_trans, dim=0).mean(dim=0)
-                        M_quats = torch.stack(M_quats, dim=0)
-                        M_quats = torch.where(M_quats[:, 0:1] < 0, -M_quats, M_quats)
-                        M_quat_avg = M_quats.mean(dim=0)
-                        M_quat_avg = M_quat_avg / torch.norm(M_quat_avg).clamp(min=1e-8)
-                        
-                        M_rot = quaternion_to_matrix(M_quat_avg)
-                        
-                        M = torch.eye(4, device="cuda")
-                        M[:3, :3] = M_rot
-                        M[:3, 3] = M_trans
-                        
-                        aligned_extrinsic = M @ extrinsic
-                        blend_weights = torch.linspace(0.0, 1.0, steps=overlap, device="cuda")
-                        
-                        blended_extrs = []
-                        for t in range(overlap):
-                            w = blend_weights[t]
-                            g_prev = prev_global_extrs[t]
-                            g_curr = aligned_extrinsic[t]
-                            
-                            t_blend = (1.0 - w) * g_prev[:3, 3] + w * g_curr[:3, 3]
-                            
-                            q_prev = matrix_to_quaternion(g_prev[:3, :3])
-                            q_curr = matrix_to_quaternion(g_curr[:3, :3])
-                            
-                            if torch.dot(q_prev, q_curr) < 0:
-                                q_curr = -q_curr
-                                
-                            q_blend = (1.0 - w) * q_prev + w * q_curr
-                            q_blend = q_blend / torch.norm(q_blend).clamp(min=1e-8)
-                            r_blend = quaternion_to_matrix(q_blend)
-                            
-                            g_blend = torch.eye(4, device="cuda")
-                            g_blend[:3, :3] = r_blend
-                            g_blend[:3, 3] = t_blend
-                            blended_extrs.append(g_blend)
-                            
-                        blended_extrs = torch.stack(blended_extrs, dim=0)
-                        
-                        blend_w_3d = blend_weights.view(overlap, 1, 1).cpu()
-                        prev_depths = final_depths[chunk_start : chunk_start + overlap]
-                        prev_uncs = final_uncs[chunk_start : chunk_start + overlap]
-                        prev_intrs = final_intrs[chunk_start : chunk_start + overlap]
-                        
-                        blended_depths = (1.0 - blend_w_3d) * prev_depths + blend_w_3d * depth_tensor_hd[:overlap].cpu()
-                        blended_uncs = (1.0 - blend_w_3d) * prev_uncs + blend_w_3d * unc_metric_hd[:overlap].cpu()
-                        blended_intrs = (1.0 - blend_weights.view(overlap, 1, 1).cpu()) * prev_intrs + blend_weights.view(overlap, 1, 1).cpu() * intrs_hd[:overlap].cpu()
-                        
-                        final_depths[chunk_start : chunk_start + overlap] = blended_depths
-                        final_uncs[chunk_start : chunk_start + overlap] = blended_uncs
-                        final_intrs[chunk_start : chunk_start + overlap] = blended_intrs
-                        final_extrs[chunk_start : chunk_start + overlap] = blended_extrs.cpu()
-                        
-                        new_len = chunk_len - overlap
-                        if new_len > 0:
-                            final_depths[start_idx : start_idx + new_len] = depth_tensor_hd[overlap:].cpu()
-                            final_uncs[start_idx : start_idx + new_len] = unc_metric_hd[overlap:].cpu()
-                            final_intrs[start_idx : start_idx + new_len] = intrs_hd[overlap:].cpu()
-                            final_extrs[start_idx : start_idx + new_len] = aligned_extrinsic[overlap:].cpu()
-                            
-                        start_idx += (chunk_size - overlap)
+            # Post-processing: copy to host in chunks
+            self.status.emit("Post-processing predictions in chunks...")
+            post_chunk_size = 8
+            
+            for start_t in range(0, num_frames, post_chunk_size):
+                end_t = min(start_t + post_chunk_size, num_frames)
+                
+                # Fetch GPU slices for intrinsics and extrinsics
+                extrinsic_chunk = predictions["poses_pred"][0, start_t:end_t].float()
+                intrinsic_chunk = predictions["intrs"][0, start_t:end_t].float()
+                
+                # Fetch depth and confidence slices (float)
+                depth_map_chunk = predictions["points_map"][start_t:end_t, ..., 2].float()  # [chunk_len, H_proc, W_proc]
+                depth_conf_chunk = predictions["unc_metric"][start_t:end_t].float()         # [chunk_len, H_proc, W_proc]
+                
+                # Store in CPU buffers without HD upsampling or scaling
+                final_depths[start_t:end_t] = depth_map_chunk.cpu()
+                final_uncs[start_t:end_t] = depth_conf_chunk.cpu()
+                final_intrs[start_t:end_t] = intrinsic_chunk.cpu()
+                final_extrs[start_t:end_t] = extrinsic_chunk.cpu()
 
-                    # Clear intermediate variables and clean CUDA cache to prevent VRAM accumulation
-                    del predictions, extrinsic, intrinsic, depth_map, depth_conf
-                    del depth_tensor_hd, unc_metric_hd, intrs_hd
-                    if 'prev_global_extrs' in locals():
-                        del prev_global_extrs, M_trans, M_quats, M_quat_avg, M_rot, M, aligned_extrinsic, blend_weights, blended_extrs, blend_w_3d, prev_depths, prev_uncs, prev_intrs, blended_depths, blended_uncs, blended_intrs
-                    torch.cuda.empty_cache()
+            # Clean up predictions and empty CUDA cache
+            del predictions
+            torch.cuda.empty_cache()
 
             extrs = final_extrs.numpy()
             intrs = final_intrs.numpy()
             depth_tensor = final_depths.numpy()
             unc_metric = final_uncs.numpy()
-            
+
             self.status.emit("Saving processed data as NPZ...")
             np.savez(self.npz_path,
                      depths=depth_tensor,
@@ -292,6 +181,8 @@ class PreprocessingThread(QThread):
             self.finished.emit(True, self.npz_path)
             
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             # Clean up model reference and cache even on failures to prevent leak
             if 'vggt4track_model' in locals():
                 del vggt4track_model
@@ -329,6 +220,45 @@ class PreprocessTool(BaseTool):
         step_layout.addWidget(self.spin_step)
         layout.addLayout(step_layout)
         
+        # Chunk Size Input (hidden as stitching has been removed)
+        chunk_layout = QHBoxLayout()
+        self.lbl_chunk = QLabel("Chunk Size:")
+        chunk_layout.addWidget(self.lbl_chunk)
+        self.spin_chunk = QSpinBox()
+        self.spin_chunk.setRange(4, 128)
+        self.spin_chunk.setValue(24)
+        self.spin_chunk.valueChanged.connect(self._on_chunk_changed)
+        chunk_layout.addWidget(self.spin_chunk)
+        layout.addLayout(chunk_layout)
+        self.lbl_chunk.hide()
+        self.spin_chunk.hide()
+        
+        # Overlap Input (hidden as stitching has been removed)
+        overlap_layout = QHBoxLayout()
+        self.lbl_overlap = QLabel("Overlap Size:")
+        overlap_layout.addWidget(self.lbl_overlap)
+        self.spin_overlap = QSpinBox()
+        self.spin_overlap.setRange(2, 64)
+        self.spin_overlap.setValue(12)
+        self.spin_overlap.valueChanged.connect(self._on_overlap_changed)
+        overlap_layout.addWidget(self.spin_overlap)
+        layout.addLayout(overlap_layout)
+        self.lbl_overlap.hide()
+        self.spin_overlap.hide()
+        
+        # Inference Size Input
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(QLabel("Inference Size:"))
+        self.combo_size = QComboBox()
+        self.combo_size.addItem("518 (High VRAM)", 518)
+        self.combo_size.addItem("336 (Medium VRAM)", 336)
+        self.combo_size.addItem("252 (Low VRAM)", 252)
+        self.combo_size.addItem("168 (Ultra Low VRAM)", 168)
+        self.combo_size.addItem("126 (Minimum VRAM)", 126)
+        self.combo_size.setCurrentIndex(1) # Default to 336
+        size_layout.addWidget(self.combo_size)
+        layout.addLayout(size_layout)
+        
         # Paths display label
         self.lbl_paths = QLabel("<b>Outputs:</b> Auto-named upon Run")
         self.lbl_paths.setWordWrap(True)
@@ -353,6 +283,15 @@ class PreprocessTool(BaseTool):
         layout.addWidget(self.lbl_status)
         
         layout.addStretch()
+
+    def _on_chunk_changed(self, val):
+        if self.spin_overlap.value() >= val:
+            self.spin_overlap.setValue(max(2, val // 2))
+        self.spin_overlap.setMaximum(max(2, val - 1))
+        
+    def _on_overlap_changed(self, val):
+        if self.spin_chunk.value() <= val:
+            self.spin_chunk.setValue(val + 1)
 
     def on_video_loaded(self, metadata):
         self.video_path = getattr(self.main_window, 'current_video_path', '')
@@ -416,12 +355,18 @@ class PreprocessTool(BaseTool):
         self.btn_run.setEnabled(False)
         self.btn_load.setEnabled(False)
         self.spin_step.setEnabled(False)
+        self.spin_chunk.setEnabled(False)
+        self.spin_overlap.setEnabled(False)
+        self.combo_size.setEnabled(False)
         
         self.lbl_status.setStyleSheet("color: #0078D7; font-weight: bold;")
         self.lbl_status.setText("<b>Status:</b> Preparing thread...")
         
         # Initialize background processing
         pts_map = getattr(self.main_window.decoder_thread, 'pts_map', [])
+        chunk_size = self.spin_chunk.value()
+        overlap = self.spin_overlap.value()
+        target_size = self.combo_size.currentData()
         self.thread = PreprocessingThread(
             video_path=self.video_path,
             start_frame=start,
@@ -429,7 +374,10 @@ class PreprocessTool(BaseTool):
             step=step,
             npz_path=npz_path,
             json_path=json_path,
-            pts_map=pts_map
+            pts_map=pts_map,
+            chunk_size=chunk_size,
+            overlap=overlap,
+            target_size=target_size
         )
         self.thread.progress.connect(self._on_thread_progress)
         self.thread.status.connect(self._on_thread_status)
@@ -447,6 +395,9 @@ class PreprocessTool(BaseTool):
         self.btn_run.setEnabled(True)
         self.btn_load.setEnabled(True)
         self.spin_step.setEnabled(True)
+        self.spin_chunk.setEnabled(True)
+        self.spin_overlap.setEnabled(True)
+        self.combo_size.setEnabled(True)
         
         if success:
             self.lbl_status.setText(f"<b>Status:</b> Success!<br>Saved to: {os.path.basename(message)}")

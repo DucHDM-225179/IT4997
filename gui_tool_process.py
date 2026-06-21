@@ -33,161 +33,33 @@ def get_video_dimensions(video_path):
         return 1920, 1080  # Reasonable HD fallback
 
 
-def generate_blender_script(npz_path, video_path, width, height, stride, start_frame):
+def generate_blender_script(npz_path, pc_npz_path, video_path, width, height, stride, start_frame):
     """
     Reads the blender_loading_script_template.py file, substitutes placeholder strings
     with resolved configuration parameters, and returns the customized Blender import script.
     """
     # Normalized paths to use forward slashes so they execute safely in Blender on Windows
     npz_norm = os.path.abspath(npz_path).replace("\\", "/")
+    pc_npz_norm = os.path.abspath(pc_npz_path).replace("\\", "/") if pc_npz_path else ""
     video_norm = os.path.abspath(video_path).replace("\\", "/")
     
     # Try reading the template file from the workspace/local directory
     # Template should be located in the project's root folder
     template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_loading_script_template.py")
-    template_code = None
     
-    if os.path.exists(template_path):
-        try:
-            with open(template_path, "r", encoding="utf-8") as f:
-                template_code = f.read()
-        except Exception as e:
-            print(f"Error reading template file: {e}")
-
-    if not template_code:
-        # Fallback inline copy of the template in case the file is missing/unreadable
-        template_code = """import bpy
-import numpy as np
-import os
-from mathutils import Matrix, Vector
-
-# --- CONFIGURATION ---
-NPZ_PATH = "TO_BE_REPLACED_NPZ_PATH"
-VIDEO_PATH = "TO_BE_REPLACED_VIDEO_PATH" 
-ORIGINAL_RES = TO_BE_REPLACED_ORIGINAL_RES # (Width, Height)
-FRAME_STRIDE = TO_BE_REPLACED_FRAME_STRIDE
-START_FRAME = TO_BE_REPLACED_START_FRAME
-# ---------------------
-
-def create_blender_camera(data):
-    intrinsics = data['intrinsics'][0] 
-    W_orig, H_orig = ORIGINAL_RES
-    
-    # Create camera
-    cam_data = bpy.data.cameras.new("SpaTrackCam")
-    cam_obj = bpy.data.objects.new("SpaTrackCam", cam_data)
-    bpy.context.collection.objects.link(cam_obj)
-    
-    # 1. Handle Focal Length (FOV)
-    fy = intrinsics[1, 1]
-    fov_v = 2 * np.arctan(H_orig / (2 * fy))
-    
-    cam_data.lens_unit = 'FOV'
-    cam_data.sensor_fit = 'VERTICAL'
-    cam_data.angle = fov_v
-    
-    # 2. Principal Point Shift
-    cam_data.shift_x = (intrinsics[0, 2] - W_orig / 2) / H_orig
-    cam_data.shift_y = (H_orig / 2 - intrinsics[1, 2]) / H_orig
-    
-    # Setup Background Video
-    if os.path.exists(VIDEO_PATH):
-        cam_data.show_background_images = True
-        bg = cam_data.background_images.new()
-        bg.source = 'MOVIE_CLIP'
-        clip = bpy.data.movieclips.load(VIDEO_PATH)
-        bg.clip = clip
-        bg.frame_method = 'STRETCH'
-        bg.alpha = 1.0
-
-    return cam_obj
-
-def load_spatrack_data(npz_path):
-    data = np.load(npz_path)
-    coords_3d = data['coords']      # (T, N, 3) World space
-    tracks_2d = data['tracks_2d']    # (T, N, 2) Image space (pixels)
-    extrinsics = data['extrinsics'] # (T, 4, 4) W2C
-    intrinsics = data['intrinsics'] # (T, 3, 3)
-    visibs = data['visibs']         # (T, N)
-    T, N, _ = coords_3d.shape
-    
-    # Use Y-scale as master scale for units
-    master_scale = 1.0 
-
-    # 1. Setup Scene
-    # Total frames is determined by data, but we offset by START_FRAME
-    bpy.context.scene.frame_start = START_FRAME
-    bpy.context.scene.frame_end = START_FRAME + (T - 1) * FRAME_STRIDE
-    bpy.context.scene.render.resolution_x = ORIGINAL_RES[0]
-    bpy.context.scene.render.resolution_y = ORIGINAL_RES[1]
-    
-    # 2. Camera
-    cam_obj = create_blender_camera(data)
-    
-    # 3. Coordinate Transformation Matrices
-    m_world_cv_to_bl = Matrix(((1,0,0,0),(0,0,1,0),(0,-1,0,0),(0,0,0,1)))
-    m_cam_cv_to_bl = Matrix(((1,0,0,0),(0,-1,0,0),(0,0,-1,0),(0,0,0,1)))
-
-    # 4. Animate Camera
-    for t in range(T):
-        blender_frame = START_FRAME + t * FRAME_STRIDE
-        w2c = Matrix(extrinsics[t].tolist())
-        c2w_cv = w2c.inverted()
-        cam_obj.matrix_world = m_world_cv_to_bl @ c2w_cv @ m_cam_cv_to_bl
-        cam_obj.keyframe_insert(data_path="location", frame=blender_frame)
-        cam_obj.keyframe_insert(data_path="rotation_euler", frame=blender_frame)
-
-    # 5. Create Point Tracks with 2D Guidance
-    points_parent = bpy.data.objects.new("Tracks", None)
-    bpy.context.collection.objects.link(points_parent)
-    
-    for n in range(N):
-        empty = bpy.data.objects.new(f"Track_{n:04d}", None)
-        empty.parent = points_parent
-        empty.empty_display_size = 0.05
-        empty.empty_display_type = 'PLAIN_AXES'
-        bpy.context.collection.objects.link(empty)
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Blender script template file not found at: {template_path}")
         
-        for t in range(T):
-            blender_frame = START_FRAME + t * FRAME_STRIDE
-            
-            # 2D guiding: Project 3D point onto the ray defined by 2D track
-            # to ensure perfect visual alignment.
-            p_world = Vector(coords_3d[t, n])
-            uv = tracks_2d[t, n] # (u, v) in pixels
-            K = intrinsics[t]
-            w2c = Matrix(extrinsics[t].tolist())
-            
-            # Ray direction in camera space
-            # d = K^-1 * [u, v, 1]^T
-            fx, fy = K[0, 0], K[1, 1]
-            cx, cy = K[0, 2], K[1, 2]
-            ray_dir_cam = Vector(((uv[0] - cx) / fx, (uv[1] - cy) / fy, 1.0))
-            
-            # Target depth in camera space (Z forward)
-            p_cam_target = w2c @ p_world
-            depth = p_cam_target.z
-            
-            # Adjusted point in camera space: follow ray to target depth
-            p_cam_corr = ray_dir_cam * depth
-            
-            # Back to world space (CV convention)
-            c2w = w2c.inverted()
-            p_world_corr = c2w @ p_cam_corr
-            
-            # Map CV coordinates to Blender Space
-            empty.location = (p_world_corr.x, p_world_corr.z, -p_world_corr.y)
-            
-            empty.keyframe_insert(data_path="location", frame=blender_frame)
-
-    print(f"Import Finished. Refined with 2D guiding for {N} tracks.")
-
-if __name__ == "__main__":
-    load_spatrack_data(NPZ_PATH)"""
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            template_code = f.read()
+    except Exception as e:
+        raise RuntimeError(f"Failed to read Blender script template file: {e}")
 
     # Clean string replacements of placeholders
     code = (template_code
             .replace('"TO_BE_REPLACED_NPZ_PATH"', f'"{npz_norm}"')
+            .replace('"TO_BE_REPLACED_PC_NPZ_PATH"', f'"{pc_npz_norm}"' if pc_npz_norm else '""')
             .replace('"TO_BE_REPLACED_VIDEO_PATH"', f'"{video_norm}"')
             .replace('TO_BE_REPLACED_ORIGINAL_RES', f'({width}, {height})')
             .replace('TO_BE_REPLACED_FRAME_STRIDE', str(stride))
@@ -404,6 +276,7 @@ class TrackingThread(QThread):
             intrs_in = preprocess_data["intrinsics"]
             extrs_in = preprocess_data["extrinsics"]
             extrs_in_c2w = np.linalg.inv(extrs_in).astype(np.float32)
+            #extrs_in_c2w = extrs_in.astype(np.float32)
             unc_metric_in = preprocess_data["unc_metric"]
 
             self.progress.emit("Interpolating depth and camera parameters to matched resolution...")
@@ -415,18 +288,20 @@ class TrackingThread(QThread):
                                         size=video_tensor.shape[2:], 
                                         mode='bilinear', align_corners=True).squeeze(1).numpy() > 0.5
 
-            # Scale camera intrinsics
-            scale_w = video_tensor.shape[3] / W_orig
-            scale_h = video_tensor.shape[2] / H_orig
+            # Scale camera intrinsics based on the downscaled preprocessed depth shape (backward-compatible)
+            scale_w = video_tensor.shape[3] / depth_in.shape[2]
+            scale_h = video_tensor.shape[2] / depth_in.shape[1]
             intrs_in[:, 0, :] *= scale_w
             intrs_in[:, 1, :] *= scale_h
 
             # Scale query points from HD original to preprocessed resized resolution
             self.progress.emit("Preparing tracking query coordinates...")
+            scale_w_query = video_tensor.shape[3] / W_orig
+            scale_h_query = video_tensor.shape[2] / H_orig
             query_xyt = np.zeros((len(self.points), 3), dtype=np.float32)
             for idx, (x_hd, y_hd) in enumerate(self.points):
-                x_proc = x_hd * scale_w
-                y_proc = y_hd * scale_h
+                x_proc = x_hd * scale_w_query
+                y_proc = y_hd * scale_h_query
                 query_xyt[idx, 0] = 0.0 # Queries correspond to frame 0 of sequence
                 query_xyt[idx, 1] = x_proc
                 query_xyt[idx, 2] = y_proc
@@ -472,7 +347,17 @@ class TrackingThread(QThread):
             results["extrinsics"] = torch.inverse(c2w_traj).cpu().numpy()
             results["intrinsics"] = intrs.cpu().numpy()
             results["visibs"] = vis_pred.cpu().numpy()
-            results["unc_metric"] = conf_pred.cpu().numpy()
+            results["confs"] = conf_pred.cpu().numpy()
+            
+            # Save tracker-refined depths, uncertainties, and resized video in downscaled tracking resolution
+            refined_depth = point_map[:, 2, ...].cpu().numpy()
+            conf_depth_np = conf_depth.cpu().numpy()
+            results["depths"] = np.where(conf_depth_np > 0.5, refined_depth, depth_tensor)
+            results["unc_metric"] = np.where(conf_depth_np > 0.5, conf_depth_np, unc_metric)
+            
+            #results["depths"] = point_map[:, 2, ...].cpu().numpy()
+            #results["unc_metric"] = conf_depth.cpu().numpy()
+            #results["video"] = (video / 255.0).cpu().numpy()
 
             self.progress.emit("Unloading model and freeing GPU cache...")
             del model
@@ -1251,36 +1136,15 @@ class ProcessVideoTool(BaseTool):
             self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
 
     def _on_load_result(self):
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "Load Tracking Session", "", "JSON Files (*_result_metadata.json)"
-        )
-        if not filename:
-            return
-            
+        from gui_preprocess_loader import load_tracking_result
         try:
-            with open(filename, 'r') as f:
-                meta = json.load(f)
+            meta, filename = load_tracking_result(self.main_window, self)
+            if not meta:
+                return
                 
-            video_path = meta.get("video_path")
             result_npz = meta.get("result_npz")
             preprocess_npz = meta.get("preprocess_npz")
             preprocess_json = meta.get("preprocess_json")
-            
-            # Check files exist
-            if not os.path.exists(video_path):
-                # Try relative resolution path
-                meta_dir = os.path.dirname(filename)
-                rel_vid = os.path.join(meta_dir, os.path.basename(video_path))
-                if os.path.exists(rel_vid):
-                    video_path = rel_vid
-                else:
-                    raise FileNotFoundError(f"Associated video not found at: {video_path}")
-            
-            # Load video via main window if needed
-            if os.path.abspath(self.video_path) != os.path.abspath(video_path):
-                success = self.main_window.load_video(video_path)
-                if not success:
-                    raise RuntimeError("Failed to load associated video.")
             
             # Load preprocess paths
             self.preprocess_npz = preprocess_npz
@@ -1338,6 +1202,150 @@ class ProcessVideoTool(BaseTool):
             self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
             self.update_overlay()
 
+    def _export_pc_npz(self, pc_path, stride=8, conf_threshold=0.5, min_depth=0.1, max_depth=20.0):
+        if self.tracking_results is None:
+            return False
+            
+        depths = self.tracking_results.get("depths")
+        unc_metric = self.tracking_results.get("unc_metric")
+        intrinsics = self.tracking_results.get("intrinsics")
+        extrinsics = self.tracking_results.get("extrinsics")
+        
+        if depths is None or extrinsics is None or intrinsics is None:
+            QMessageBox.critical(self, "Export Failed", "Missing depth, intrinsics, or extrinsics.")
+            return False
+            
+        T = len(depths)
+        H_depth, W_depth = depths.shape[1], depths.shape[2]
+        from PyQt6.QtWidgets import QProgressDialog
+        from PyQt6.QtCore import Qt
+        progress = QProgressDialog("Decoding video frames for point cloud...", "Cancel", 0, T + 10, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        QApplication.processEvents()
+        
+        import av
+        try:
+            container = av.open(self.video_path, container_options={'ignore_editlist': '1'})
+            video_stream = container.streams.video[0]
+            video_stream.thread_type = "AUTO"
+            pts_map = getattr(self.main_window.decoder_thread, 'pts_map', [])
+            if pts_map and self.start_frame < len(pts_map):
+                container.seek(pts_map[self.start_frame], stream=video_stream, backward=True)
+            needed_frame_indices = set(self.start_frame + t * self.step for t in range(T))
+            decoded_frames = {}
+            count = 0
+            for frame in container.decode(video=0):
+                if progress.wasCanceled():
+                    container.close()
+                    return False
+                if frame.pts is None:
+                    continue
+                try:
+                    idx = pts_map.index(frame.pts) if pts_map else count
+                except ValueError:
+                    continue
+                if idx < self.start_frame:
+                    if not pts_map:
+                        count += 1
+                    continue
+                if idx > self.end_frame:
+                    break
+                if (idx - self.start_frame) % self.step == 0:
+                    decoded_frames[idx] = frame.to_rgb().to_ndarray()
+                    progress.setValue(int(len(decoded_frames) * T / len(needed_frame_indices)))
+                    QApplication.processEvents()
+                    if len(decoded_frames) == len(needed_frame_indices):
+                        break
+                if not pts_map:
+                    count += 1
+            container.close()
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Error decoding video: {e}")
+            return False
+            
+        if len(decoded_frames) == 0:
+            QMessageBox.critical(self, "Export Failed", "No video frames could be decoded.")
+            return False
+        first_idx = next(iter(decoded_frames))
+        H_orig, W_orig = decoded_frames[first_idx].shape[0], decoded_frames[first_idx].shape[1]
+        scale_x = W_depth / W_orig
+        scale_y = H_depth / H_orig
+        progress.setLabelText("Lifting depth maps to 3D point cloud sequence...")
+        progress.setValue(T)
+        QApplication.processEvents()
+        M = (H_depth // stride) * (W_depth // stride)
+        points_seq = np.zeros((T, M, 3), dtype=np.float32)
+        colors_seq = np.zeros((T, M, 3), dtype=np.uint8)
+        for t in range(T):
+            if progress.wasCanceled():
+                return False
+            frame_idx = self.start_frame + t * self.step
+            if frame_idx not in decoded_frames:
+                continue
+            img_rgb = decoded_frames[frame_idx]
+            depth = depths[t]
+            conf = unc_metric[t] if unc_metric is not None else None
+            K = intrinsics[t]
+            w2c = extrinsics[t]
+            try:
+                c2w_cv = np.linalg.inv(w2c)
+            except np.linalg.LinAlgError:
+                continue
+            cam_x = c2w_cv[0, 3]
+            cam_y = c2w_cv[2, 3]
+            cam_z = -c2w_cv[1, 3]
+            fx, fy = K[0, 0], K[1, 1]
+            cx, cy = K[0, 2], K[1, 2]
+            fx_depth = fx * scale_x
+            fy_depth = fy * scale_y
+            cx_depth = cx * scale_x
+            cy_depth = cy * scale_y
+            pt_idx = 0
+            for y in range(0, H_depth, stride):
+                for x in range(0, W_depth, stride):
+                    if pt_idx >= M:
+                        break
+                    d = depth[y, x]
+                    is_valid = True
+                    if conf is not None:
+                        c_val = conf[y, x]
+                        if isinstance(c_val, (bool, np.bool_)):
+                            if not c_val:
+                                is_valid = False
+                        else:
+                            if c_val < conf_threshold:
+                                is_valid = False
+                    if d < min_depth or d > max_depth:
+                        is_valid = False
+                    if is_valid:
+                        X_cam = (x - cx_depth) * d / fx_depth
+                        Y_cam = (y - cy_depth) * d / fy_depth
+                        Z_cam = d
+                        P_cam = np.array([X_cam, Y_cam, Z_cam, 1.0])
+                        P_world_cv = c2w_cv @ P_cam
+                        points_seq[t, pt_idx] = [P_world_cv[0], P_world_cv[2], -P_world_cv[1]]
+                        u_orig = int(np.clip(round(x / scale_x), 0, W_orig - 1))
+                        v_orig = int(np.clip(round(y / scale_y), 0, H_orig - 1))
+                        colors_seq[t, pt_idx] = img_rgb[v_orig, u_orig]
+                    else:
+                        points_seq[t, pt_idx] = [cam_x, cam_y, cam_z]
+                        colors_seq[t, pt_idx] = [0, 0, 0]
+                    pt_idx += 1
+            progress.setValue(T + int((t + 1) * 10 / T))
+            QApplication.processEvents()
+        progress.setLabelText("Writing point cloud NPZ file...")
+        QApplication.processEvents()
+        try:
+            np.savez(pc_path, points=points_seq, colors=colors_seq)
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Failed to write NPZ file: {e}")
+            return False
+        finally:
+            progress.close()
+
     def _on_generate_blender_script(self):
         if not self.video_path:
             QMessageBox.warning(self, "Warning", "No video loaded!")
@@ -1362,6 +1370,33 @@ class ProcessVideoTool(BaseTool):
             else:
                 return
                 
+        # Resolve default PC path
+        default_pc_path = npz_path.replace("_result.npz", "_pc.npz")
+        if not default_pc_path.endswith(".npz"):
+            default_pc_path = os.path.splitext(npz_path)[0] + "_pc.npz"
+            
+        pc_path, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Save Animated Point Cloud Data (Cancel to skip)", 
+            default_pc_path, 
+            "NPZ Files (*.npz)"
+        )
+        
+        if pc_path:
+            # User wants to save a point cloud
+            ply_ok = self._export_pc_npz(pc_path)
+            if not ply_ok:
+                reply = QMessageBox.question(
+                    self,
+                    "Point Cloud Export Failed",
+                    "Point cloud export failed or was cancelled. Would you like to generate the Blender script without the point cloud?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.No:
+                    return
+                pc_path = ""
+                
         # Resolve dimensions
         w = getattr(self, 'video_width', 0)
         h = getattr(self, 'video_height', 0)
@@ -1378,6 +1413,7 @@ class ProcessVideoTool(BaseTool):
         try:
             script_code = generate_blender_script(
                 npz_path=npz_path,
+                pc_npz_path=pc_path,
                 video_path=self.video_path,
                 width=w,
                 height=h,

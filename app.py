@@ -218,8 +218,12 @@ def gpu_run_tracker(tracker_model_arg, tracker_viser_arg, temp_dir, video_name, 
                             intrs=intrs, extrs=extrs, 
                             queries=query_xyt,
                             fps=1, full_point=False, iters_track=4,
-                            query_no_BA=True, fixed_cam=False, stage=1, unc_metric=unc_metric,
+                            query_no_BA=True, fixed_cam=True, stage=1, unc_metric=unc_metric,
                             support_frame=len(video_tensor)-1, replace_ratio=0.2)
+
+        # When fixed_cam=True, the model returns W2C matrices in c2w_traj instead of C2W.
+        # We invert it here to ensure it conforms to the C2W convention expected by the coordinate calculation.
+        c2w_traj = torch.inverse(c2w_traj)
 
         # Resize results to avoid large I/O
         max_size = 224

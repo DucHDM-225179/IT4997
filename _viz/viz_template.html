@@ -692,6 +692,45 @@
         </div>
       </div>
 
+      <div class="settings-group" id="mesh-settings-group" style="display: none;">
+        <h3>3D Mesh Transform</h3>
+        <div class="checkbox-container">
+          <label class="toggle-switch">
+            <input type="checkbox" id="show-mesh" checked>
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="show-mesh">Show Mesh</label>
+        </div>
+        <div class="slider-container">
+          <label for="mesh-scale">Scale</label>
+          <input type="range" id="mesh-scale" min="0.001" max="2.0" step="0.001" value="0.1">
+        </div>
+        <div class="slider-container">
+          <label for="mesh-offset-x">Offset X</label>
+          <input type="range" id="mesh-offset-x" min="-2.0" max="2.0" step="0.01" value="0.0">
+        </div>
+        <div class="slider-container">
+          <label for="mesh-offset-y">Offset Y</label>
+          <input type="range" id="mesh-offset-y" min="-2.0" max="2.0" step="0.01" value="0.0">
+        </div>
+        <div class="slider-container">
+          <label for="mesh-offset-z">Offset Z</label>
+          <input type="range" id="mesh-offset-z" min="-2.0" max="2.0" step="0.01" value="0.0">
+        </div>
+        <div class="slider-container">
+          <label for="mesh-yaw">Yaw (Z-rot)</label>
+          <input type="range" id="mesh-yaw" min="-180" max="180" step="1" value="0">
+        </div>
+        <div class="slider-container">
+          <label for="mesh-pitch">Pitch (Y-rot)</label>
+          <input type="range" id="mesh-pitch" min="-180" max="180" step="1" value="0">
+        </div>
+        <div class="slider-container">
+          <label for="mesh-roll">Roll (X-rot)</label>
+          <input type="range" id="mesh-roll" min="-180" max="180" step="1" value="0">
+        </div>
+      </div>
+
       <div class="settings-group">
         <h3>Background</h3>
         <div class="checkbox-container">
@@ -774,7 +813,15 @@
           showSettingsBtn: document.getElementById('show-settings-btn'),
           enableKeepHistory: document.getElementById('enable-keep-history'),
           historyStride: document.getElementById('history-stride'),
-          whiteBackground: document.getElementById('white-background')
+          whiteBackground: document.getElementById('white-background'),
+          showMesh: document.getElementById('show-mesh'),
+          meshScale: document.getElementById('mesh-scale'),
+          meshOffsetX: document.getElementById('mesh-offset-x'),
+          meshOffsetY: document.getElementById('mesh-offset-y'),
+          meshOffsetZ: document.getElementById('mesh-offset-z'),
+          meshYaw: document.getElementById('mesh-yaw'),
+          meshPitch: document.getElementById('mesh-pitch'),
+          meshRoll: document.getElementById('mesh-roll')
         };
         
         this.scene = null;
@@ -784,6 +831,7 @@
         this.pointCloud = null;
         this.trajectories = [];
         this.cameraFrustum = null;
+        this.overlayMesh = null;
         
         // Keep History functionality
         this.historyPointClouds = [];
@@ -1040,6 +1088,23 @@
             this.toggleBackground();
           });
         }
+
+        // Mesh transform event listeners
+        if (this.ui.showMesh) {
+          this.ui.showMesh.addEventListener('change', () => {
+            if (this.overlayMesh) {
+              this.overlayMesh.visible = this.ui.showMesh.checked;
+            }
+          });
+        }
+        
+        ['meshScale', 'meshOffsetX', 'meshOffsetY', 'meshOffsetZ', 'meshYaw', 'meshPitch', 'meshRoll'].forEach(prop => {
+          if (this.ui[prop]) {
+            this.ui[prop].addEventListener('input', () => {
+              this.updateMeshTransform(this.currentFrame);
+            });
+          }
+        });
       }
       
       makeElementDraggable(element) {
@@ -1146,6 +1211,7 @@
             switch (dtype) {
               case "uint8": typedArray = new Uint8Array(slice); break;
               case "uint16": typedArray = new Uint16Array(slice); break;
+              case "int32": typedArray = new Int32Array(slice); break;
               case "float32": typedArray = new Float32Array(slice); break;
               case "float64": typedArray = new Float64Array(slice); break;
               default: throw new Error(`Unknown dtype: ${dtype}`);
@@ -1157,11 +1223,32 @@
           this.data = arrays;
           this.config = header.meta;
           
+          // Show and initialize mesh settings group if mesh data is present
+          if (this.data.mesh_vertices && this.data.mesh_vertices.shape[0] > 0) {
+            const meshGroupEl = document.getElementById('mesh-settings-group');
+            if (meshGroupEl) meshGroupEl.style.display = 'block';
+            
+            if (this.config.mesh_scale !== undefined && this.ui.meshScale) {
+              this.ui.meshScale.value = this.config.mesh_scale;
+            }
+            if (this.config.mesh_offset !== undefined) {
+              if (this.ui.meshOffsetX) this.ui.meshOffsetX.value = this.config.mesh_offset[0];
+              if (this.ui.meshOffsetY) this.ui.meshOffsetY.value = this.config.mesh_offset[1];
+              if (this.ui.meshOffsetZ) this.ui.meshOffsetZ.value = this.config.mesh_offset[2];
+            }
+            if (this.config.mesh_rotation !== undefined) {
+              if (this.ui.meshYaw) this.ui.meshYaw.value = this.config.mesh_rotation[0];
+              if (this.ui.meshPitch) this.ui.meshPitch.value = this.config.mesh_rotation[1];
+              if (this.ui.meshRoll) this.ui.meshRoll.value = this.config.mesh_rotation[2];
+            }
+          }
+          
           this.initCameraWithCorrectFOV();
           this.ui.loadingText.textContent = "Creating point cloud...";
           
           this.initPointCloud();
           this.initTrajectories();
+          this.initMesh();
           
           setTimeout(() => {
             this.ui.loadingOverlay.classList.add('fade-out');
@@ -1175,6 +1262,149 @@
         }
       }
       
+      initMesh() {
+        if (!this.data.mesh_vertices || this.data.mesh_vertices.shape[0] === 0) return;
+        
+        const vertices = this.data.mesh_vertices.data;
+        const faces = this.data.mesh_faces.data;
+        
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+        
+        if (faces && faces.length > 0) {
+          geometry.setIndex(new THREE.BufferAttribute(faces, 1));
+        }
+        
+        let material;
+        if (this.data.mesh_vertex_colors && this.data.mesh_vertex_colors.data.length > 0) {
+          const colors = this.data.mesh_vertex_colors.data;
+          geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+          material = new THREE.MeshPhongMaterial({
+            vertexColors: true,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.8,
+            shininess: 80,
+            specular: 0xffffff
+          });
+        } else {
+          material = new THREE.MeshPhongMaterial({
+            color: 0xff4081,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.8,
+            shininess: 80,
+            specular: 0xffffff
+          });
+        }
+        
+        this.overlayMesh = new THREE.Mesh(geometry, material);
+        this.scene.add(this.overlayMesh);
+        
+        this.overlayMesh.matrixAutoUpdate = false;
+        
+        if (this.ui.showMesh) {
+          this.overlayMesh.visible = this.ui.showMesh.checked;
+        }
+        
+        this.updateMeshTransform(this.currentFrame);
+      }
+      
+      updateMeshTransform(frameIndex) {
+        if (!this.overlayMesh || !this.data.mesh_centers || !this.data.mesh_rotations) return;
+        
+        const scale = parseFloat(this.ui.meshScale.value);
+        const ox = parseFloat(this.ui.meshOffsetX.value);
+        const oy = parseFloat(this.ui.meshOffsetY.value);
+        const oz = parseFloat(this.ui.meshOffsetZ.value);
+        const yaw = parseFloat(this.ui.meshYaw.value);
+        const pitch = parseFloat(this.ui.meshPitch.value);
+        const roll = parseFloat(this.ui.meshRoll.value);
+        
+        const R_offset = this.getEulerRotationMatrix(yaw, pitch, roll);
+        
+        const T_t = this.data.mesh_centers.data;
+        const R_t = this.data.mesh_rotations.data;
+        
+        const cx = T_t[frameIndex * 3];
+        const cy = T_t[frameIndex * 3 + 1];
+        const cz = T_t[frameIndex * 3 + 2];
+        
+        const rOffset = frameIndex * 9;
+        const rt00 = R_t[rOffset],     rt01 = R_t[rOffset + 1], rt02 = R_t[rOffset + 2];
+        const rt10 = R_t[rOffset + 3], rt11 = R_t[rOffset + 4], rt12 = R_t[rOffset + 5];
+        const rt20 = R_t[rOffset + 6], rt21 = R_t[rOffset + 7], rt22 = R_t[rOffset + 8];
+        
+        const r00 = rt00*R_offset[0] + rt01*R_offset[3] + rt02*R_offset[6];
+        const r01 = rt00*R_offset[1] + rt01*R_offset[4] + rt02*R_offset[7];
+        const r02 = rt00*R_offset[2] + rt01*R_offset[5] + rt02*R_offset[8];
+        
+        const r10 = rt10*R_offset[0] + rt11*R_offset[3] + rt12*R_offset[6];
+        const r11 = rt10*R_offset[1] + rt11*R_offset[4] + rt12*R_offset[7];
+        const r12 = rt10*R_offset[2] + rt11*R_offset[5] + rt12*R_offset[8];
+        
+        const r20 = rt20*R_offset[0] + rt21*R_offset[3] + rt22*R_offset[6];
+        const r21 = rt20*R_offset[1] + rt21*R_offset[4] + rt22*R_offset[7];
+        const r22 = rt20*R_offset[2] + rt21*R_offset[5] + rt22*R_offset[8];
+        
+        const tcx = r00 * ox + r01 * oy + r02 * oz + cx;
+        const tcy = r10 * ox + r11 * oy + r12 * oz + cy;
+        const tcz = r20 * ox + r21 * oy + r22 * oz + cz;
+        
+        const m = new THREE.Matrix4();
+        m.set(
+          scale * r00,  scale * r01,  scale * r02,  tcx,
+          -scale * r10, -scale * r11, -scale * r12, -tcy,
+          -scale * r20, -scale * r21, -scale * r22, -tcz,
+          0,            0,            0,            1
+        );
+        
+        this.overlayMesh.matrix.copy(m);
+      }
+      
+      getEulerRotationMatrix(yaw_deg, pitch_deg, roll_deg) {
+        const yaw = yaw_deg * Math.PI / 180;
+        const pitch = pitch_deg * Math.PI / 180;
+        const roll = roll_deg * Math.PI / 180;
+
+        const cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+        const cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+        const cosR = Math.cos(roll), sinR = Math.sin(roll);
+
+        const Rz = [
+          cosY, -sinY, 0,
+          sinY, cosY, 0,
+          0, 0, 1
+        ];
+
+        const Ry = [
+          cosP, 0, sinP,
+          0, 1, 0,
+          -sinP, 0, cosP
+        ];
+
+        const Rx = [
+          1, 0, 0,
+          0, cosR, -sinR,
+          0, sinR, cosR
+        ];
+
+        const temp = this.multiply3x3(Rz, Ry);
+        return this.multiply3x3(temp, Rx);
+      }
+
+      multiply3x3(A, B) {
+        const C = new Float32Array(9);
+        for (let r = 0; r < 3; r++) {
+          for (let c = 0; c < 3; c++) {
+            C[r * 3 + c] = A[r * 3 + 0] * B[0 * 3 + c] +
+                          A[r * 3 + 1] * B[1 * 3 + c] +
+                          A[r * 3 + 2] * B[2 * 3 + c];
+          }
+        }
+        return C;
+      }
+
       initPointCloud() {
         const numPoints = this.config.resolution[0] * this.config.resolution[1];
         const positions = new Float32Array(numPoints * 3);
@@ -1370,6 +1600,9 @@
         }
 
         this.updateCameraFrustum(frameIndex);
+        
+        // Update 3D overlay mesh
+        this.updateMeshTransform(frameIndex);
       }
       
       updateTrajectories(frameIndex) {

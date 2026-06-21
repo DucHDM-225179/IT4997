@@ -11,6 +11,7 @@ import logging
 import os
 import warnings
 
+import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -58,18 +59,42 @@ class Attention(nn.Module):
             k = self.rope(k, pos)
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-            )
+            if not self.training and N > 1024:
+                q_chunks = torch.split(q, 1024, dim=2)
+                x_chunks = []
+                for q_chunk in q_chunks:
+                    x_chunk = F.scaled_dot_product_attention(
+                        q_chunk,
+                        k,
+                        v,
+                        dropout_p=0.0,
+                    )
+                    x_chunks.append(x_chunk)
+                x = torch.cat(x_chunks, dim=2)
+            else:
+                x = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    dropout_p=self.attn_drop.p if self.training else 0.0,
+                )
         else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
+            if not self.training and N > 1024:
+                scaled_q = q * self.scale
+                q_chunks = torch.split(scaled_q, 1024, dim=2)
+                x_chunks = []
+                for q_chunk in q_chunks:
+                    attn = q_chunk @ k.transpose(-2, -1)
+                    attn = attn.softmax(dim=-1)
+                    x_chunk = attn @ v
+                    x_chunks.append(x_chunk)
+                x = torch.cat(x_chunks, dim=2)
+            else:
+                q = q * self.scale
+                attn = q @ k.transpose(-2, -1)
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn)
+                x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
