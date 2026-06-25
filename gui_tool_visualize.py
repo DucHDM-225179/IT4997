@@ -1,111 +1,126 @@
 import os
-import json
-import numpy as np
 import cv2
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog
+import numpy as np
+import math
+from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
+                             QWidget, QFileDialog, QComboBox, QCheckBox)
 from PyQt6.QtGui import QImage
+from PyQt6.QtCore import Qt
+
 from gui_tool_base import BaseTool
 
 class VisualizeVideoTool(BaseTool):
-    """Tool to visualize preprocessed/processed depth maps with a jet colormap in the viewport."""
-    def __init__(self, main_window, parent=None):
-        super().__init__(main_window, parent)
-        
-        # Internal state
+    """Tool to overlay Depth Map and VGGT4Track intermediate outputs onto the video frame."""
+    
+    def __init__(self, session, parent=None):
+        super().__init__(session, parent)
         self.depths = None
         self.unc_metric = None
         self.start_frame = 0
         self.end_frame = 0
         self.step = 1
         self.loaded_npz_path = ""
+        self.loaded_json_path = ""
         self.video_path = ""
         
         self._init_ui()
         
+        # Sync initial state if already loaded
+        self.video_path = self.session.get("video_path", "")
+        self.auto_detect_data()
+        self.update_ui_state()
+
     def get_name(self):
-        return "Visualize Depth Map"
-        
+        return "Visualize Preprocessed Data"
+
     def _init_ui(self):
         layout = QVBoxLayout(self)
         
-        # Title
-        title = QLabel("<b>Visualize Video (Depth Map)</b>")
-        title.setStyleSheet("font-size: 14px; color: #2196F3; font-weight: bold; margin-bottom: 10px;")
-        layout.addWidget(title)
+        # Status Section
+        lbl_status_title = QLabel("<b>Status</b>")
+        layout.addWidget(lbl_status_title)
         
-        # Status Card Widget
-        status_card = QWidget()
-        status_card.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333; border-radius: 6px; padding: 10px;")
-        status_layout = QVBoxLayout(status_card)
+        self.lbl_status = QLabel("Preprocess Data: [Not Loaded]")
+        self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
+        layout.addWidget(self.lbl_status)
         
-        # Status Label
-        self.lbl_status = QLabel("Visualization Data: Not Loaded")
-        self.lbl_status.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 12px;")
-        self.lbl_status.setWordWrap(True)
-        status_layout.addWidget(self.lbl_status)
-        
-        # Details Label
-        self.lbl_details = QLabel("No active preprocessed depth maps found. Please run preprocessing or tracking first, or load a session.")
+        self.lbl_details = QLabel("No preprocessed NPZ loaded. Auto-detecting output folders or load manually.")
         self.lbl_details.setStyleSheet("color: #AAAAAA; font-size: 11px;")
         self.lbl_details.setWordWrap(True)
-        status_layout.addWidget(self.lbl_details)
+        layout.addWidget(self.lbl_details)
         
-        layout.addWidget(status_card)
+        # Controls Section
+        layout.addWidget(QLabel("----------------------------------------"))
+        lbl_ctrl_title = QLabel("<b>Controls</b>")
+        layout.addWidget(lbl_ctrl_title)
         
-        # Load Button
-        self.btn_load = QPushButton("Load NPZ / Metadata JSON")
-        self.btn_load.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                font-weight: bold;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 12px;
-                font-size: 12px;
-                margin-top: 10px;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:pressed {
-                background-color: #0D47A1;
-            }
-        """)
+        # Colormap Select
+        cmap_layout = QHBoxLayout()
+        cmap_layout.addWidget(QLabel("Colormap:"))
+        self.combo_cmap = QComboBox()
+        self.combo_cmap.addItem("Magma", cv2.COLORMAP_MAGMA)
+        self.combo_cmap.addItem("Inferno", cv2.COLORMAP_INFERNO)
+        self.combo_cmap.addItem("Plasma", cv2.COLORMAP_PLASMA)
+        self.combo_cmap.addItem("Viridis", cv2.COLORMAP_VIRIDIS)
+        self.combo_cmap.addItem("Jet", cv2.COLORMAP_JET)
+        self.combo_cmap.addItem("Rainbow", cv2.COLORMAP_RAINBOW)
+        self.combo_cmap.currentIndexChanged.connect(self.refresh_display)
+        cmap_layout.addWidget(self.combo_cmap)
+        layout.addLayout(cmap_layout)
+        
+        # Uncertainty Mask Checkbox
+        self.cb_unc_mask = QCheckBox("Mask High Uncertainty (>0.5)")
+        self.cb_unc_mask.setChecked(True)
+        self.cb_unc_mask.stateChanged.connect(self.refresh_display)
+        layout.addWidget(self.cb_unc_mask)
+        
+        # Manual Load Button
+        self.btn_load = QPushButton("Load Preprocess Manually [load]")
+        self.btn_load.setStyleSheet("background-color: #E1E1E1; font-weight: bold; padding: 5px;")
         self.btn_load.clicked.connect(self._on_manual_load)
         layout.addWidget(self.btn_load)
         
         layout.addStretch()
-        
+
+    def _on_session_changed(self, key, value):
+        if key == "video_metadata":
+            if value:
+                self.depths = None
+                self.unc_metric = None
+                self.start_frame = 0
+                self.end_frame = 0
+                self.step = 1
+                self.loaded_npz_path = ""
+                self.loaded_json_path = ""
+                self.video_path = value.get("video_path", "")
+                self.auto_detect_data()
+                self.update_ui_state()
+        elif key == "video_path":
+            self.video_path = value or ""
+            self.auto_detect_data()
+        elif key == "current_frame":
+            if value is not None and self.isVisible():
+                self.refresh_display()
+        elif key in ("preprocess_npz", "preprocess_json"):
+            self.auto_detect_data()
+
     def showEvent(self, event):
         super().showEvent(event)
-        self.video_path = getattr(self.main_window, 'current_video_path', '')
+        self.video_path = self.session.get('video_path', '')
         self.auto_detect_data()
         self.refresh_display()
         
     def hideEvent(self, event):
         super().hideEvent(event)
-        # Restore the original RGB video frame when switching away
-        if self.main_window.timeline_slider.isEnabled():
-            frame_idx = self.main_window.timeline_slider.value()
-            self.main_window.decoder_thread.seek_frame(frame_idx)
-            
-    def on_video_loaded(self, metadata):
-        # Reset state on new video load
-        self.depths = None
-        self.unc_metric = None
-        self.start_frame = 0
-        self.end_frame = 0
-        self.step = 1
-        self.loaded_npz_path = ""
-        self.video_path = metadata.get("video_path", "")
-        
-        # Try to auto-detect
-        self.auto_detect_data()
-        self.update_ui_state()
-        
-    def on_frame_changed(self, frame_idx, current_time_sec):
-        # When active and playing, overwrite the viewport image with the depth map
+        # Restore the original RGB video frame when switching away by clearing override
+        self.session.set("override_display_image", None)
+
+    def refresh_display(self):
+        if self.depths is not None and self.session.get("video_metadata") is not None:
+            frame_idx = self.session.get("current_frame", 0)
+            self._update_override_display(frame_idx)
+
+    def _update_override_display(self, frame_idx):
         if self.depths is not None:
             if self.start_frame <= frame_idx <= self.end_frame:
                 offset = frame_idx - self.start_frame
@@ -113,135 +128,71 @@ class VisualizeVideoTool(BaseTool):
                 if 0 <= idx_in_depths < len(self.depths):
                     qimage_depth = self.get_depth_qimage(idx_in_depths)
                     if qimage_depth:
-                        self.main_window.video_view.set_image(qimage_depth)
-                        
-    def refresh_display(self):
-        if self.depths is not None and self.main_window.timeline_slider.isEnabled():
-            frame_idx = self.main_window.timeline_slider.value()
-            self.on_frame_changed(frame_idx, 0.0)
-            
+                        self.session.set("override_display_image", qimage_depth)
+                        return
+        self.session.set("override_display_image", None)
+
     def auto_detect_data(self):
-        # 1. Search ProcessVideoTool for preprocess_npz
-        from gui_tool_process import ProcessVideoTool
-        process_tool = None
-        for tool in self.main_window.tools:
-            if isinstance(tool, ProcessVideoTool):
-                process_tool = tool
-                break
-                
-        if process_tool and process_tool.preprocess_npz and os.path.exists(process_tool.preprocess_npz):
-            success = self.load_visualization_data(process_tool.preprocess_npz, process_tool.preprocess_json)
+        npz_path = self.session.get("preprocess_npz")
+        json_path = self.session.get("preprocess_json")
+        if npz_path and os.path.exists(npz_path):
+            success = self.load_visualization_data(npz_path, json_path)
             if success:
                 self.update_ui_state()
                 return
-                
-        # 2. Search PreprocessTool output paths
-        from gui_tool_preprocess import PreprocessTool
-        preprocess_tool = None
-        for tool in self.main_window.tools:
-            if isinstance(tool, PreprocessTool):
-                preprocess_tool = tool
-                break
-                
-        if preprocess_tool:
-            npz_path, json_path = preprocess_tool._get_output_paths()
-            if npz_path and os.path.exists(npz_path):
-                success = self.load_visualization_data(npz_path, json_path)
-                if success:
-                    self.update_ui_state()
-                    return
-                    
+
     def load_visualization_data(self, npz_path, json_path=None):
-        if not npz_path or not os.path.exists(npz_path):
-            return False
+        if self.loaded_npz_path == npz_path:
+            return True
             
-        start_frame = 0
-        end_frame = 0
-        step = 1
-        
-        is_result_npz = False
-        original_npz_path = npz_path
-        
-        # Check if the file is a results NPZ directly and see if we can load it
-        try:
-            temp_data = np.load(npz_path, allow_pickle=True)
-            if "depths" in temp_data:
-                is_result_npz = True
-        except Exception:
-            pass
-            
-        # Try to resolve companion json path
-        if not json_path:
-            if npz_path.endswith("_intermediate.npz"):
-                json_path = npz_path.replace("_intermediate.npz", "_metadata.json")
-            elif npz_path.endswith("_result.npz"):
-                json_path = npz_path.replace("_result.npz", "_result_metadata.json")
-            else:
-                json_path = os.path.splitext(npz_path)[0] + ".json"
-                
-        if json_path and os.path.exists(json_path):
-            try:
-                with open(json_path, 'r') as f:
-                    meta = json.load(f)
-                start_frame = meta.get("start_frame", 0)
-                end_frame = meta.get("end_frame", 0)
-                step = meta.get("step", 1)
-                
-                # If this is result metadata and we don't have depths directly, redirect to the preprocessed intermediate NPZ
-                if not is_result_npz and "preprocess_npz" in meta:
-                    prep_npz = meta["preprocess_npz"]
-                    if os.path.exists(prep_npz):
-                        npz_path = prep_npz
-            except Exception as e:
-                print(f"Error loading companion json: {e}")
-                
         try:
             data = np.load(npz_path, allow_pickle=True)
-            if "depths" not in data:
-                data = np.load(original_npz_path, allow_pickle=True)
-                
-            if "depths" not in data:
+            if "depths" not in data.files:
                 return False
                 
             self.depths = data["depths"]
-            self.unc_metric = data.get("unc_metric", None)
-            self.start_frame = start_frame
-            self.end_frame = end_frame
-            self.step = step
+            self.unc_metric = data["unc_metric"] if "unc_metric" in data.files else None
+            self.loaded_npz_path = npz_path
             
-            # Use original_npz_path if it had depths directly, otherwise use npz_path
-            self.loaded_npz_path = original_npz_path if is_result_npz else npz_path
+            # Read metadata JSON if provided
+            if json_path and os.path.exists(json_path):
+                with open(json_path, 'r') as f:
+                    meta = json.load(f)
+                self.start_frame = meta.get("start_frame", 0)
+                self.end_frame = meta.get("end_frame", 0)
+                self.step = meta.get("step", 1)
+            else:
+                # Default fallback
+                self.start_frame = 0
+                self.step = 1
+                self.end_frame = len(self.depths) - 1
+                
             return True
-        except Exception as e:
-            print(f"Error loading npz file: {e}")
+        except Exception:
             return False
-            
+
     def update_ui_state(self):
         if self.depths is not None:
-            self.lbl_status.setText("Visualization Data: Loaded")
-            self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold; font-size: 12px;")
-            
-            basename = os.path.basename(self.loaded_npz_path)
-            details = (
-                f"<b>File:</b> {basename}<br>"
-                f"<b>Frames:</b> {len(self.depths)}<br>"
-                f"<b>Resolution:</b> {self.depths.shape[2]}x{self.depths.shape[1]}<br>"
-                f"<b>Trim Bounds:</b> {self.start_frame} to {self.end_frame} (step {self.step})"
-            )
+            self.lbl_status.setText("Preprocess Data: [Loaded]")
+            self.lbl_status.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            filename = os.path.basename(self.loaded_npz_path)
+            details = f"File: {filename}\nRange: {self.start_frame} to {self.end_frame} (step {self.step})\nFrames: {len(self.depths)}"
+            if self.unc_metric is not None:
+                details += "\nUncertainty metrics available."
             self.lbl_details.setText(details)
-            self.lbl_details.setStyleSheet("color: #E0E0E0; font-size: 11px;")
+            self.lbl_details.setStyleSheet("color: #4CAF50; font-size: 11px;")
         else:
-            self.lbl_status.setText("Visualization Data: Not Loaded")
-            self.lbl_status.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 12px;")
-            self.lbl_details.setText("No active preprocessed depth maps found. Please run preprocessing or tracking first, or load a session.")
+            self.lbl_status.setText("Preprocess Data: [Not Loaded]")
+            self.lbl_status.setStyleSheet("color: #F44336; font-weight: bold;")
+            self.lbl_details.setText("No preprocessed NPZ loaded. Auto-detecting output folders or load manually.")
             self.lbl_details.setStyleSheet("color: #AAAAAA; font-size: 11px;")
-            
+
     def get_depth_qimage(self, idx):
         try:
             frame = self.depths[idx].copy()
             
             # Apply uncertainty masking if available
-            if self.unc_metric is not None:
+            if self.unc_metric is not None and self.cb_unc_mask.isChecked():
                 try:
                     unc_frame = self.unc_metric[idx]
                     if unc_frame.dtype == bool:
@@ -253,8 +204,10 @@ class VisualizeVideoTool(BaseTool):
                     pass
                     
             # Resize depth frame to match the original video dimensions on the fly
-            meta = self.main_window.decoder_thread.get_metadata()
-            w_target, h_target = meta.get("width", 0), meta.get("height", 0)
+            meta = self.session.get("video_metadata")
+            w_target, h_target = 0, 0
+            if meta:
+                w_target, h_target = meta.get("width", 0), meta.get("height", 0)
             if w_target > 0 and h_target > 0:
                 frame = cv2.resize(frame, (w_target, h_target), interpolation=cv2.INTER_NEAREST)
                     
@@ -268,25 +221,28 @@ class VisualizeVideoTool(BaseTool):
                 d_max = np.percentile(valid_depths, 98)
                 if d_max == d_min:
                     d_max += 1e-6
+                frame = np.clip(frame, d_min, d_max)
+                frame = (frame - d_min) / (d_max - d_min)
             else:
-                d_min, d_max = 0.0, 1.0
+                frame = np.zeros_like(frame)
                 
-            frame_clipped = np.clip(frame, d_min, d_max)
-            frame_norm = ((frame_clipped - d_min) / (d_max - d_min) * 255.0).astype(np.uint8)
+            frame = (frame * 255.0).astype(np.uint8)
             
-            # Default to colormap JET, don't provide option to change color
-            frame_colored = cv2.applyColorMap(frame_norm, cv2.COLORMAP_JET)
-            frame_colored[invalid_mask] = 0
+            # Apply Colormap
+            colormap_idx = self.combo_cmap.currentData()
+            colored = cv2.applyColorMap(frame, colormap_idx)
+            colored = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
             
-            frame_rgb = cv2.cvtColor(frame_colored, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame_rgb.shape
+            # Paint invalid pixels black
+            colored[invalid_mask] = [0, 0, 0]
+            
+            h, w, ch = colored.shape
             bytes_per_line = ch * w
-            qimage = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            return qimage.copy()
+            return QImage(colored.tobytes(), w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
         except Exception as e:
             print(f"Error rendering depth frame: {e}")
             return None
-            
+
     def _on_manual_load(self):
         filename, _ = QFileDialog.getOpenFileName(
             self, "Load Preprocessed NPZ or JSON Metadata", "", "Supported Files (*_intermediate.npz *_metadata.json *.npz *.json)"
@@ -300,7 +256,7 @@ class VisualizeVideoTool(BaseTool):
         if filename.endswith(".json"):
             from gui_preprocess_loader import load_preprocess_metadata
             try:
-                meta, filename = load_preprocess_metadata(self.main_window, self, filename)
+                meta, filename = load_preprocess_metadata(self.session, self, filename)
                 if meta:
                     npz_path = meta.get("npz_path") or meta.get("preprocess_npz")
                     json_path = filename
@@ -316,6 +272,11 @@ class VisualizeVideoTool(BaseTool):
         if npz_path and os.path.exists(npz_path):
             success = self.load_visualization_data(npz_path, json_path)
             if success:
+                # Update session paths so other tools sync automatically
+                self.session.set("preprocess_npz", npz_path)
+                if json_path:
+                    self.session.set("preprocess_json", json_path)
+                    
                 self.update_ui_state()
                 self.refresh_display()
             else:

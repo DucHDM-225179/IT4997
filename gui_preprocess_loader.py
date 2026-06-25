@@ -2,11 +2,13 @@ import os
 import json
 from PyQt6.QtWidgets import QFileDialog, QMessageBox
 
-def gui_tool_load_video(main_window, parent_widget, video_path, json_path=None):
+from gui_backend import get_video_dimensions
+
+def gui_tool_load_video(session, parent_widget, video_path, json_path=None):
     """
     Universal video loader that resolves absolute or relative video paths.
     If the video file is not found, prompts the user to locate it.
-    If a new video is loaded, loads it into the main_window.
+    If a new video is loaded, sets the video_path key in the session.
     """
     if not video_path:
         QMessageBox.critical(parent_widget, "Error", "No video path specified.")
@@ -41,21 +43,25 @@ def gui_tool_load_video(main_window, parent_widget, video_path, json_path=None):
                 )
                 return None
 
-    # Load video into main window if it's different from the currently loaded video
-    current_video = getattr(main_window, 'current_video_path', '')
+    # Verify the video can be opened using backend dimensions utility
+    try:
+        w, h = get_video_dimensions(resolved_path)
+    except Exception as e:
+        QMessageBox.critical(
+            parent_widget,
+            "Error",
+            f"Failed to open video file: {resolved_path}\nError: {e}"
+        )
+        return None
+
+    # Load video into session state if it's different from the currently loaded video
+    current_video = session.get('video_path', '')
     if not current_video or os.path.abspath(current_video) != resolved_path:
-        success = main_window.load_video(resolved_path)
-        if not success:
-            QMessageBox.critical(
-                parent_widget,
-                "Error",
-                f"Failed to load video file: {resolved_path}"
-            )
-            return None
+        session.set('video_path', resolved_path)
 
     return resolved_path
 
-def load_preprocess_metadata(main_window, parent_widget, filename=None):
+def load_preprocess_metadata(session, parent_widget, filename=None):
     """
     Universal loader for preprocessing metadata JSON.
     """
@@ -79,7 +85,7 @@ def load_preprocess_metadata(main_window, parent_widget, filename=None):
 
     # Resolve video path
     video_path = meta.get("video_path")
-    resolved_video_path = gui_tool_load_video(main_window, parent_widget, video_path, filename)
+    resolved_video_path = gui_tool_load_video(session, parent_widget, video_path, filename)
     if not resolved_video_path:
         return None, None
     meta["video_path"] = resolved_video_path
@@ -107,10 +113,15 @@ def load_preprocess_metadata(main_window, parent_widget, filename=None):
                 f"The preprocessed NPZ file was not found at:\n{resolved_npz}\n\n"
                 "Please run preprocessing again to generate it."
             )
+        else:
+            # Sync session reactively
+            session.set("preprocess_npz", resolved_npz)
+            session.set("preprocess_json", filename)
+            session.set("trim_range", (meta.get("start_frame", 0), meta.get("end_frame", 0)))
 
     return meta, filename
 
-def load_tracking_result(main_window, parent_widget, filename=None):
+def load_tracking_result(session, parent_widget, filename=None):
     """
     Universal loader for tracking session / result metadata JSON.
     """
@@ -134,7 +145,7 @@ def load_tracking_result(main_window, parent_widget, filename=None):
 
     # Resolve video path
     video_path = meta.get("video_path")
-    resolved_video_path = gui_tool_load_video(main_window, parent_widget, video_path, filename)
+    resolved_video_path = gui_tool_load_video(session, parent_widget, video_path, filename)
     if not resolved_video_path:
         return None, None
     meta["video_path"] = resolved_video_path
@@ -188,5 +199,15 @@ def load_tracking_result(main_window, parent_widget, filename=None):
             "The following associated data files were not found and might need update/regeneration:\n" +
             "\n".join(f"- {item}" for item in missing)
         )
+    
+    # Sync session reactively
+    if meta.get("preprocess_npz") and os.path.exists(meta["preprocess_npz"]):
+        session.set("preprocess_npz", meta["preprocess_npz"])
+    if meta.get("preprocess_json") and os.path.exists(meta["preprocess_json"]):
+        session.set("preprocess_json", meta["preprocess_json"])
+    if meta.get("result_npz") and os.path.exists(meta["result_npz"]):
+        session.set("tracking_result_npz", meta["result_npz"])
+    
+    session.set("trim_range", (meta.get("start_frame", 0), meta.get("end_frame", 0)))
 
     return meta, filename

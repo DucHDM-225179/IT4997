@@ -32,6 +32,7 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        perform_chunking: bool = True,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -58,43 +59,45 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
+        # Define your maximum safe thresholds for inference
+        MAX_N = 1024
+        MAX_B = 16 # Adjust based on your GPU memory limits
+
         if self.fused_attn:
-            if not self.training and N > 1024:
-                q_chunks = torch.split(q, 1024, dim=2)
-                x_chunks = []
-                for q_chunk in q_chunks:
-                    x_chunk = F.scaled_dot_product_attention(
-                        q_chunk,
-                        k,
-                        v,
-                        dropout_p=0.0,
-                    )
-                    x_chunks.append(x_chunk)
-                x = torch.cat(x_chunks, dim=2)
+            if not self.training and perform_chunking and (N > MAX_N or B > MAX_B):
+                b_split_size = MAX_B if B > MAX_B else B
+                q_batches = torch.split(q, b_split_size, dim=0)
+                k_batches = torch.split(k, b_split_size, dim=0)
+                v_batches = torch.split(v, b_split_size, dim=0)
+                
+                x_b_chunks = []
+                for q_b, k_b, v_b in zip(q_batches, k_batches, v_batches):
+                    if N > MAX_N:
+                        q_chunks = torch.split(q_b, MAX_N, dim=2)
+                        x_n_chunks = []
+                        for q_chunk in q_chunks:
+                            x_chunk = F.scaled_dot_product_attention(
+                                q_chunk, k_b, v_b, dropout_p=0.0
+                            )
+                            x_n_chunks.append(x_chunk)
+                        x_b_chunks.append(torch.cat(x_n_chunks, dim=2))
+                    else:
+                        x_chunk = F.scaled_dot_product_attention(
+                            q_b, k_b, v_b, dropout_p=0.0
+                        )
+                        x_b_chunks.append(x_chunk)
+                
+                x = torch.cat(x_b_chunks, dim=0)
             else:
                 x = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    dropout_p=self.attn_drop.p if self.training else 0.0,
+                    q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0,
                 )
         else:
-            if not self.training and N > 1024:
-                scaled_q = q * self.scale
-                q_chunks = torch.split(scaled_q, 1024, dim=2)
-                x_chunks = []
-                for q_chunk in q_chunks:
-                    attn = q_chunk @ k.transpose(-2, -1)
-                    attn = attn.softmax(dim=-1)
-                    x_chunk = attn @ v
-                    x_chunks.append(x_chunk)
-                x = torch.cat(x_chunks, dim=2)
-            else:
-                q = q * self.scale
-                attn = q @ k.transpose(-2, -1)
-                attn = attn.softmax(dim=-1)
-                attn = self.attn_drop(attn)
-                x = attn @ v
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)

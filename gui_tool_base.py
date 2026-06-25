@@ -2,17 +2,16 @@ from PyQt6.QtWidgets import QWidget
 
 class BaseTool(QWidget):
     """Base class for all editor tools."""
-    def __init__(self, main_window, parent=None):
+    def __init__(self, session, parent=None):
         super().__init__(parent)
-        self.main_window = main_window
+        self.session = session
+        
+        # Share session changed notifications reactively across all tools
+        self.session.changed.connect(self._on_session_changed)
 
     def get_name(self):
         return "Base Tool"
 
-    def on_frame_changed(self, frame_idx, current_time_sec):
-        """Called when the video frame updates."""
-        pass
-        
-    def on_video_loaded(self, metadata):
-        """Called when a new video is loaded."""
+    def _on_session_changed(self, key, value):
+        """Virtual method to be overridden by subclasses."""
         pass

@@ -1,15 +1,11 @@
 from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QPushButton, QLabel
-from PyQt6.QtCore import pyqtSignal
 from gui_tool_base import BaseTool
 
 class TrimTool(BaseTool):
     """Tool to define an active processing window (trim)."""
     
-    # Signal emitted when trim region changes (start_frame, end_frame)
-    trim_applied = pyqtSignal(int, int)
-    
-    def __init__(self, main_window, parent=None):
-        super().__init__(main_window, parent)
+    def __init__(self, session, parent=None):
+        super().__init__(session, parent)
         
         self.start_frame = 0
         self.end_frame = 0
@@ -46,19 +42,41 @@ class TrimTool(BaseTool):
         self.btn_set_start.clicked.connect(self._on_set_start)
         self.btn_set_end.clicked.connect(self._on_set_end)
         self.btn_trim.clicked.connect(self._on_trim)
+
+        # Sync initial state if video metadata is already loaded
+        meta = self.session.get("video_metadata")
+        if meta:
+            self.total_frames = meta.get('total_frames', 0)
+            trim_range = self.session.get("trim_range")
+            if trim_range:
+                self.start_frame, self.end_frame = trim_range
+            else:
+                self.start_frame = 0
+                self.end_frame = max(0, self.total_frames - 1)
+            self._update_labels()
+            
+        current = self.session.get("current_frame")
+        if current is not None:
+            self.current_frame = current
         
     def get_name(self):
         return "Video Trimming"
-        
-    def on_video_loaded(self, metadata):
-        self.total_frames = metadata.get('total_frames', 0)
-        self.start_frame = 0
-        self.end_frame = max(0, self.total_frames - 1)
-        self._update_labels()
- 
-    def on_frame_changed(self, frame_idx, current_time_sec):
-        self.current_frame = frame_idx
- 
+
+    def _on_session_changed(self, key, value):
+        if key == "video_metadata":
+            if value:
+                self.total_frames = value.get('total_frames', 0)
+                self.start_frame = 0
+                self.end_frame = max(0, self.total_frames - 1)
+                self._update_labels()
+        elif key == "current_frame":
+            if value is not None:
+                self.current_frame = value
+        elif key == "trim_range":
+            if value:
+                self.start_frame, self.end_frame = value
+                self._update_labels()
+         
     def _on_set_start(self):
         if self.current_frame <= self.end_frame or self.end_frame == 0:
             self.start_frame = self.current_frame
@@ -78,4 +96,4 @@ class TrimTool(BaseTool):
         
     def _on_trim(self):
         """Apply the trim, which will restrict the timeline."""
-        self.trim_applied.emit(self.start_frame, self.end_frame)
+        self.session.set("trim_range", (self.start_frame, self.end_frame))

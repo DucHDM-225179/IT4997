@@ -2,12 +2,11 @@ import sys
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QSlider, QPushButton, QLabel, 
                              QFileDialog, QComboBox, QStackedWidget, QScrollArea, QFrame)
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 
-from gui_backend import VideoDecoderThread
 from gui_view import VideoGraphicsView
-from gui_tools import TrimTool, PreprocessTool, ProcessVideoTool, AddingObjectTool, AddingObject2DTool, VisualizeVideoTool
-
+from gui_tools import EXPOSED_TOOLS
+from gui_state import SessionState
 
 class VideoEditorApp(QMainWindow):
     def __init__(self):
@@ -15,14 +14,16 @@ class VideoEditorApp(QMainWindow):
         self.setWindowTitle("Simple Video Editor")
         self.resize(1024, 768)
         
-        # Core Components
-        self.decoder_thread = VideoDecoderThread()
-        self.decoder_thread.frameReady.connect(self.on_frame_ready)
+        # Initialize Shared Session State (Layer 1 uses it, but it's part of core)
+        self.session = SessionState()
+        self.session.changed.connect(self._on_session_changed)
         
         self._init_ui()
-        self._init_tools()
         
-        self.decoder_thread.start()
+        # Register decoder in state so background threads in Layer 0/1 can use it
+        self.session.set("decoder", self.video_view.decoder_thread)
+        
+        self._init_tools()
 
     def _init_ui(self):
         # Menu Bar
@@ -39,8 +40,14 @@ class VideoEditorApp(QMainWindow):
         # Top Area (Video Preview + Tools)
         top_layout = QHBoxLayout()
         
-        # Preview
-        self.video_view = VideoGraphicsView()
+        # Preview View (Layer 1 component)
+        self.video_view = VideoGraphicsView(session=self.session)
+        self.video_view.frame_ready.connect(self.on_frame_ready)
+        
+        # Bridge mouse events from view to session keys reactively
+        self.video_view.pixelClicked.connect(lambda x, y: self.session.set("pixel_clicked", (x, y)))
+        self.video_view.boxSelected.connect(lambda x1, y1, x2, y2: self.session.set("box_selected", (x1, y1, x2, y2)))
+        
         top_layout.addWidget(self.video_view, stretch=3)
         
         # Tools Right Panel
@@ -78,8 +85,8 @@ class VideoEditorApp(QMainWindow):
         self.btn_step_fwd = QPushButton("Step >")
         
         self.btn_play_pause.clicked.connect(self.toggle_play)
-        self.btn_step_back.clicked.connect(self.decoder_thread.step_backward)
-        self.btn_step_fwd.clicked.connect(self.decoder_thread.step_forward)
+        self.btn_step_back.clicked.connect(self.video_view.step_backward)
+        self.btn_step_fwd.clicked.connect(self.video_view.step_forward)
         
         self.lbl_time = QLabel("00:00:00 / 00:00:00")
         self.lbl_frame = QLabel("Frame: 0 / 0")
@@ -99,25 +106,9 @@ class VideoEditorApp(QMainWindow):
     def _init_tools(self):
         self.tools = []
         
-        # Initialize tools
-        trim_tool = TrimTool(self)
-        trim_tool.trim_applied.connect(self.apply_timeline_restriction)
-        
-        preprocess_tool = PreprocessTool(self)
-        process_video_tool = ProcessVideoTool(self)
-        visualize_tool = VisualizeVideoTool(self)
-        adding_object_tool = AddingObjectTool(self)
-        # adding_object_2d_tool = AddingObject2DTool(self)
-        
-        self.tools.append(trim_tool)
-        self.tools.append(preprocess_tool)
-        self.tools.append(process_video_tool)
-        self.tools.append(visualize_tool)
-        self.tools.append(adding_object_tool)
-        # self.tools.append(adding_object_2d_tool)
-
-        
-        for tool in self.tools:
+        for cls in EXPOSED_TOOLS:
+            tool = cls(self.session, parent=self)
+            self.tools.append(tool)
             self.tool_selector.addItem(tool.get_name())
             self.tool_stack.addWidget(tool)
             
@@ -129,90 +120,96 @@ class VideoEditorApp(QMainWindow):
     def _on_tool_changed(self, index):
         self.current_tool = self.tools[index]
 
+    def _on_session_changed(self, key, value):
+        if key == "trim_range":
+            if value:
+                start_frame, end_frame = value
+                self.timeline_slider.setMinimum(start_frame)
+                self.timeline_slider.setMaximum(end_frame)
+                
+                current = self.timeline_slider.value()
+                if current < start_frame or current > end_frame:
+                    self.video_view.seek_frame(start_frame)
+        elif key == "seek_frame":
+            if value is not None:
+                self.video_view.seek_frame(value)
+        elif key == "video_path":
+            if value and value != getattr(self, "current_video_path", ""):
+                self.load_video(value)
+
     def open_video(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Open Video", "", "Video Files (*.mp4 *.avi *.mkv *.mov)")
         if filename:
             self.load_video(filename)
 
     def load_video(self, filename):
-        self.decoder_thread.pause()
+        self.video_view.pause()
         self.btn_play_pause.setText("Play")
         
-        # Save path for other tools
         self.current_video_path = filename
+        self.session.set("video_path", filename)
         
-        if self.decoder_thread.open_video(filename):
-            metadata = self.decoder_thread.get_metadata()
+        # Clear old video session data to prevent leakage into the new session
+        self.session.set("preprocess_npz", None)
+        self.session.set("preprocess_json", None)
+        self.session.set("tracking_result_npz", None)
+        self.session.set("overlay_data", None)
+        
+        if self.video_view.load_video(filename):
+            metadata = self.video_view.get_metadata()
+            self.session.set("video_metadata", metadata)
             
-            # Reset timeline
+            # Reset timeline state in session so all tools sync reactively
+            self.session.set("trim_range", (0, metadata['total_frames'] - 1))
+            self.session.set("current_frame", 0)
+            
+            # Reset timeline slider locally
             self.timeline_slider.setEnabled(True)
             self.timeline_slider.setMinimum(0)
             self.timeline_slider.setMaximum(metadata['total_frames'] - 1)
             self.timeline_slider.setValue(0)
             
-            # Inform tools
-            for tool in self.tools:
-                tool.on_video_loaded(metadata)
-                
             # Seek to first frame
-            self.decoder_thread.seek_frame(0)
+            self.video_view.seek_frame(0)
             return True
         return False
 
     def toggle_play(self):
-        if not self.decoder_thread.container:
+        if not self.video_view.has_container():
             return
             
-        if self.decoder_thread._is_playing:
-            self.decoder_thread.pause()
+        if self.video_view.is_playing():
+            self.video_view.pause()
             self.btn_play_pause.setText("Play")
         else:
-            self.decoder_thread.play()
+            self.video_view.play()
             self.btn_play_pause.setText("Pause")
 
     def on_slider_moved(self, value):
-        self.decoder_thread.seek_frame(value)
+        self.video_view.seek_frame(value)
 
     def on_frame_ready(self, qimage, frame_idx, time_sec):
-        # Update view
-        self.video_view.set_image(qimage)
-        
         # Update slider without triggering seek
         self.timeline_slider.blockSignals(True)
         self.timeline_slider.setValue(frame_idx)
         self.timeline_slider.blockSignals(False)
         
         # Update labels
-        metadata = self.decoder_thread.get_metadata()
+        metadata = self.video_view.get_metadata()
         tot_frames = metadata.get('total_frames', 0)
         tot_sec = metadata.get('duration_sec', 0)
         
         self.lbl_frame.setText(f"Frame: {frame_idx} / {tot_frames}")
         self.lbl_time.setText(f"{self.format_time(time_sec)} / {self.format_time(tot_sec)}")
         
-        # Stop playback if we reached the end of the restricted timeline
-        if self.decoder_thread._is_playing and frame_idx >= self.timeline_slider.maximum():
-            self.decoder_thread.pause()
-            self.btn_play_pause.setText("Play")
-            
-        # Stop playback if we reached the total end
-        elif self.decoder_thread._is_playing and frame_idx >= tot_frames - 1:
-            self.decoder_thread.pause()
+        # Stop playback if we reached the end of the restricted timeline or absolute end
+        is_playing = self.video_view.is_playing()
+        if is_playing and (frame_idx >= self.timeline_slider.maximum() or frame_idx >= tot_frames - 1):
+            self.video_view.pause()
             self.btn_play_pause.setText("Play")
         
-        # Notify current tool
-        if self.current_tool:
-            self.current_tool.on_frame_changed(frame_idx, time_sec)
-
-    def apply_timeline_restriction(self, start_frame, end_frame):
-        """Restricts the slider to the given range."""
-        self.timeline_slider.setMinimum(start_frame)
-        self.timeline_slider.setMaximum(end_frame)
-        
-        # Snap current position if outside bounds
-        current = self.timeline_slider.value()
-        if current < start_frame or current > end_frame:
-            self.decoder_thread.seek_frame(start_frame)
+        # Publish current frame index to session state so tools react
+        self.session.set("current_frame", frame_idx)
 
     @staticmethod
     def format_time(seconds):
@@ -223,7 +220,7 @@ class VideoEditorApp(QMainWindow):
         return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
     def closeEvent(self, event):
-        self.decoder_thread.stop()
+        self.video_view.stop()
         super().closeEvent(event)
 
 if __name__ == "__main__":

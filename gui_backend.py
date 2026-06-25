@@ -25,6 +25,7 @@ class VideoDecoderThread(QThread):
         self.total_frames = 0
         self.duration_sec = 0.0
         self.pts_map = []
+        self.current_video_path = ""
         
         self.current_frame_idx = -1
         self.current_time_sec = 0.0
@@ -40,6 +41,7 @@ class VideoDecoderThread(QThread):
                 self.container = av.open(path, container_options={'ignore_editlist': '1'})
                 self.video_stream = self.container.streams.video[0]
                 self.video_stream.thread_type = "AUTO"  # enable multi-threading decoding
+                self.current_video_path = path
                 
                 # Build PTS map for frame-accurate seeking and true frame count
                 # We use decode() instead of demux() because some packets don't yield frames
@@ -68,6 +70,7 @@ class VideoDecoderThread(QThread):
                 print(f"Error opening video: {e}")
                 self.container = None
                 self.video_stream = None
+                self.current_video_path = ""
                 return False
 
     def get_metadata(self):
@@ -77,7 +80,9 @@ class VideoDecoderThread(QThread):
                 "total_frames": self.total_frames,
                 "duration_sec": self.duration_sec,
                 "width": self.video_stream.width if self.video_stream else 0,
-                "height": self.video_stream.height if self.video_stream else 0
+                "height": self.video_stream.height if self.video_stream else 0,
+                "video_path": self.current_video_path,
+                "pts_map": self.pts_map
             }
 
     def play(self):
@@ -207,3 +212,69 @@ class VideoDecoderThread(QThread):
             self.current_time_sec = current_sec
             
         self.frameReady.emit(qimg, frame_idx, current_sec)
+
+    def decode_current_video_frames(self, start_frame, end_frame, step=1):
+        """
+        Creates a separate reader container to decode frames from the currently
+        loaded video file. Restricts decoding strictly to the current video.
+        """
+        with QMutexLocker(self.mutex):
+            if not self.current_video_path:
+                raise ValueError("No video is currently loaded in the backend.")
+            video_path = self.current_video_path
+            pts_map = self.pts_map
+            
+        return _decode_video_frames(video_path, start_frame, end_frame, step, pts_map)
+
+
+def get_video_dimensions(video_path):
+    """Safely reads and returns (width, height) of a video using PyAV."""
+    try:
+        container = av.open(video_path, container_options={'ignore_editlist': '1'})
+        video_stream = container.streams.video[0]
+        w, h = video_stream.width, video_stream.height
+        container.close()
+        return w, h
+    except Exception as e:
+        print(f"Error getting video dimensions: {e}")
+        return 1920, 1080  # Reasonable HD fallback
+
+
+def _decode_video_frames(video_path, start_frame, end_frame, step=1, pts_map=None):
+    """
+    Generator that yields (frame_index, rgb_ndarray) for a specific range.
+    Decoupled from GUI thread state so it can run inside background workers.
+    """
+    try:
+        container = av.open(video_path, container_options={'ignore_editlist': '1'})
+        video_stream = container.streams.video[0]
+        video_stream.thread_type = "AUTO"
+        
+        if pts_map and start_frame < len(pts_map):
+            container.seek(pts_map[start_frame], stream=video_stream, backward=True)
+            
+        count = 0
+        for frame in container.decode(video=0):
+            if frame.pts is None:
+                continue
+            try:
+                idx = pts_map.index(frame.pts) if pts_map else count
+            except ValueError:
+                continue
+                
+            if idx < start_frame:
+                if not pts_map:
+                    count += 1
+                continue
+            if idx > end_frame:
+                break
+                
+            if (idx - start_frame) % step == 0:
+                yield idx, frame.to_rgb().to_ndarray()
+                
+            if not pts_map:
+                count += 1
+        container.close()
+    except Exception as e:
+        print(f"Error decoding video range: {e}")
+

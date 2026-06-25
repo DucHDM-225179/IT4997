@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import logging
 import torch
 import torch.nn as nn
@@ -27,7 +28,6 @@ class Aggregator(nn.Module):
     The Aggregator applies alternating-attention over input frames,
     as described in VGGT: Visual Geometry Grounded Transformer.
 
-
     Args:
         img_size (int): Image size in pixels.
         patch_size (int): Size of each patch for PatchEmbed.
@@ -46,6 +46,7 @@ class Aggregator(nn.Module):
         qk_norm (bool): Whether to apply QK normalization.
         rope_freq (int): Base frequency for rotary embedding. -1 to disable.
         init_values (float): Init scale for layer scale.
+        offload_blocks (bool): Whether to swap attention block weights in-place to save VRAM during inference.
     """
 
     def __init__(
@@ -67,8 +68,12 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        offload_blocks=True,
     ):
         super().__init__()
+
+        self.offload_blocks = offload_blocks
+        self._offload_prepared = False
 
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
@@ -185,6 +190,35 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
+    def _prepare_offload(self):
+        """Lazily prepares pinned memory states and runner modules for VRAM-efficient inference."""
+        if self._offload_prepared:
+            return
+
+        has_cuda = torch.cuda.is_available()
+
+        self.pinned_frame_weights = []
+        for block in self.frame_blocks:
+            block.to('cpu')  # Force offload to free GPU VRAM
+            if has_cuda:
+                self.pinned_frame_weights.append({k: v.pin_memory() for k, v in block.state_dict().items()})
+            else:
+                self.pinned_frame_weights.append({k: v.clone() for k, v in block.state_dict().items()})
+
+        self.pinned_global_weights = []
+        for block in self.global_blocks:
+            block.to('cpu')
+            if has_cuda:
+                self.pinned_global_weights.append({k: v.pin_memory() for k, v in block.state_dict().items()})
+            else:
+                self.pinned_global_weights.append({k: v.clone() for k, v in block.state_dict().items()})
+
+        # Create single runner instances that will stay on the GPU
+        self.gpu_frame_runner = copy.deepcopy(self.frame_blocks[0])
+        self.gpu_global_runner = copy.deepcopy(self.global_blocks[0])
+
+        self._offload_prepared = True
+
     def forward(
         self,
         images: torch.Tensor,
@@ -212,6 +246,11 @@ class Aggregator(nn.Module):
 
         # Reshape to [B*S, C, H, W] for patch embedding
         images = images.view(B * S, C_in, H, W)
+        
+        # Prepare memory swapping structure if offload is enabled and we are doing inference
+        if not self.training and self.offload_blocks:
+            self._prepare_offload()
+
         if not self.training:
             # Ensure patch_embed is on the same device as images
             patch_embed_device = next(self.patch_embed.parameters()).device
@@ -250,14 +289,15 @@ class Aggregator(nn.Module):
 
         pos = None
         if self.rope is not None:
-            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=tokens.device)
 
         if self.patch_start_idx > 0:
             # do not use position embedding for special tokens (camera and register tokens)
             # so set pos to 0 for the special tokens
-            pos = pos + 1
-            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
-            pos = torch.cat([pos_special, pos], dim=1)
+            if pos is not None:
+                pos = pos + 1
+                pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(tokens.device).to(pos.dtype)
+                pos = torch.cat([pos_special, pos], dim=1)
 
         # update P because we added special tokens
         _, P, C = tokens.shape
@@ -271,8 +311,6 @@ class Aggregator(nn.Module):
         output_list = []
 
         total_layers = self.aa_block_num * len(self.aa_order) // 2 # Since we concat frame and global
-        # Actually aa_block_num is self.depth // self.aa_block_size.
-        # Total output_list length will be self.aa_block_num.
         
         for block_idx in range(self.aa_block_num):
             for attn_type in self.aa_order:
@@ -296,16 +334,12 @@ class Aggregator(nn.Module):
                     else:
                         output_list.append(concat_inter)
 
-        del concat_inter
-        del frame_intermediates
-        del global_intermediates
         return output_list, self.patch_start_idx
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
-        # If needed, reshape tokens or positions:
         if tokens.shape != (B * S, P, C):
             tokens = tokens.view(B, S, P, C).view(B * S, P, C)
 
@@ -314,17 +348,33 @@ class Aggregator(nn.Module):
 
         intermediates = []
 
-        # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
                 tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=False)
+            elif self.offload_blocks:
+                runner = self.gpu_frame_runner
+                if next(runner.parameters()).device != tokens.device:
+                    runner.to(tokens.device)
+
+                # In-place weight swap from pinned memory
+                target_state = self.pinned_frame_weights[frame_idx]
+                with torch.no_grad():
+                    for name, param in runner.named_parameters():
+                        param.copy_(target_state[name], non_blocking=True)
+
+                frame_chunk_size = 8
+                out_tokens_list = []
+                for i in range(0, B * S, frame_chunk_size):
+                    chunk_tokens = tokens[i : i + frame_chunk_size]
+                    chunk_pos = pos[i : i + frame_chunk_size] if pos is not None else None
+                    chunk_out = runner(chunk_tokens, pos=chunk_pos)
+                    out_tokens_list.append(chunk_out)
+                tokens = torch.cat(out_tokens_list, dim=0)
             else:
-                # Ensure block is on the correct device
                 block_device = next(self.frame_blocks[frame_idx].parameters()).device
                 if block_device != tokens.device:
                     self.frame_blocks[frame_idx].to(tokens.device)
 
-                # Process in chunks of frames to save VRAM when not training
                 frame_chunk_size = 8
                 out_tokens_list = []
                 for i in range(0, B * S, frame_chunk_size):
@@ -333,6 +383,7 @@ class Aggregator(nn.Module):
                     chunk_out = self.frame_blocks[frame_idx](chunk_tokens, pos=chunk_pos)
                     out_tokens_list.append(chunk_out)
                 tokens = torch.cat(out_tokens_list, dim=0)
+
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
@@ -350,17 +401,28 @@ class Aggregator(nn.Module):
 
         intermediates = []
 
-        # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=False)
+            elif self.offload_blocks:
+                runner = self.gpu_global_runner
+                if next(runner.parameters()).device != tokens.device:
+                    runner.to(tokens.device)
+
+                # In-place weight swap from pinned memory
+                target_state = self.pinned_global_weights[global_idx]
+                with torch.no_grad():
+                    for name, param in runner.named_parameters():
+                        param.copy_(target_state[name], non_blocking=True)
+
+                tokens = runner(tokens, pos=pos)
             else:
-                # Ensure block is on the correct device
                 block_device = next(self.global_blocks[global_idx].parameters()).device
                 if block_device != tokens.device:
                     self.global_blocks[global_idx].to(tokens.device)
 
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)
+
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
