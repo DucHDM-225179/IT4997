@@ -69,11 +69,13 @@ class Aggregator(nn.Module):
         rope_freq=100,
         init_values=0.01,
         offload_blocks=True,
+        enable_chunking=True,
     ):
         super().__init__()
 
         self.offload_blocks = offload_blocks
         self._offload_prepared = False
+        self.enable_chunking = enable_chunking
 
         self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
 
@@ -93,6 +95,7 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    enable_chunking=self.enable_chunking
                 )
                 for _ in range(depth)
             ]
@@ -110,6 +113,7 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    enable_chunking=self.enable_chunking
                 )
                 for _ in range(depth)
             ]

@@ -32,7 +32,7 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
-        perform_chunking: bool = True,
+        enable_chunking: bool = True,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -49,6 +49,8 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
+        self.enable_chunking = enable_chunking
+
     def forward(self, x: Tensor, pos=None) -> Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -64,7 +66,7 @@ class Attention(nn.Module):
         MAX_B = 16 # Adjust based on your GPU memory limits
 
         if self.fused_attn:
-            if not self.training and perform_chunking and (N > MAX_N or B > MAX_B):
+            if not self.training and self.enable_chunking and (N > MAX_N or B > MAX_B):
                 b_split_size = MAX_B if B > MAX_B else B
                 q_batches = torch.split(q, b_split_size, dim=0)
                 k_batches = torch.split(k, b_split_size, dim=0)

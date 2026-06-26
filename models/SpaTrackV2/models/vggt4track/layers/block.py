@@ -44,10 +44,12 @@ class Block(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        enable_chunking=True,
     ) -> None:
         super().__init__()
 
         self.norm1 = norm_layer(dim)
+        self.enable_chunking = enable_chunking
 
         self.attn = attn_class(
             dim,
@@ -59,6 +61,7 @@ class Block(nn.Module):
             qk_norm=qk_norm,
             fused_attn=fused_attn,
             rope=rope,
+            enable_chunking=self.enable_chunking
         )
 
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()

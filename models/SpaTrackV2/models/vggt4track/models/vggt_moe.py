@@ -20,10 +20,11 @@ from einops import rearrange
 import torch.nn.functional as F
 
 class VGGT4Track(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, offload_block=True, enable_chunking=True):
         super().__init__()
 
-        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim,
+            offload_block=offload_block, enable_chunking=enable_chunking)
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="sigmoid")
 
