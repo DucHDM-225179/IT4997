@@ -24,7 +24,7 @@ class VGGT4Track(nn.Module, PyTorchModelHubMixin):
         super().__init__()
 
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim,
-            offload_block=offload_block, enable_chunking=enable_chunking)
+            offload_blocks=offload_block, enable_chunking=enable_chunking)
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="sigmoid")
 
