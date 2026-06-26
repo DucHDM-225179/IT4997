@@ -114,28 +114,6 @@ def run_benchmark():
     device = "cuda"
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    # Load VGGT4Track with both chunking and offload enabled
-    print("\nLoading VGGT4Track model...")
-    vggt_model = VGGT4Track.from_pretrained(
-        "Yuxihenry/SpatialTrackerV2_Front",
-        offload_block=True,
-        enable_chunking=True
-    )
-    vggt_model.eval()
-    vggt_model = vggt_model.to(device=device, dtype=dtype)
-
-    # Load Predictor
-    print("Loading Predictor model...")
-    predictor = Predictor.from_pretrained("Yuxihenry/SpatialTrackerV2-Online")
-    predictor.spatrack.track_num = 120
-    predictor.S_wind = 30
-    predictor.overlap = 10
-    predictor.eval()
-    predictor.to(device)
-    if hasattr(predictor.spatrack, "base_model") and predictor.spatrack.base_model is not None:
-        predictor.spatrack.base_model.to("cpu")
-    torch.cuda.empty_cache()
-
     # Results nested dictionary: length -> resolution -> list of metric dicts
     eval_results = {L: {R: [] for R in test_resolutions} for L in lengths}
 
@@ -160,11 +138,7 @@ def run_benchmark():
             continue
 
         H_orig, W_orig = raw_frames[0].shape[0], raw_frames[0].shape[1]
-        
-        # Ground-truth max resolution shape
         W_gt, H_gt = compute_aspect_preserving_size(W_orig, H_orig, 518)
-        
-        # Prepare 48 query points (8x6 grid) on the ground-truth resolution
         query_xyt = get_grid_queries(W_gt, H_gt, cols=8, rows=6)
 
         # Scale frames to GT resolution (518 max-dim)
@@ -179,14 +153,25 @@ def run_benchmark():
             # Slice video tensors to length
             video_tensor_gt_L = video_tensor_gt[:actual_len]
             
-            # Preprocess the sliced video at GT resolution (518) to get ground truth
+            # -------------------------------------------------------------
+            # GROUND TRUTH LABELS GENERATION (Preprocess at 518, Refiner at 518)
+            # -------------------------------------------------------------
+            
+            # Preprocess Phase GT
             preprocess_frames_gt = []
             for t in range(actual_len):
                 img_proc = preprocess_image(video_tensor_gt_L[t], target_size=518)
                 preprocess_frames_gt.append(img_proc)
             vggt_input_gt = torch.stack(preprocess_frames_gt).to(device=device, dtype=dtype)
             
-            # 1. Run Ground Truth (Preprocess and Track Refiner both at 518)
+            # Clean VRAM & load VGGT4Track
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            vggt_model = VGGT4Track.from_pretrained(
+                "Yuxihenry/SpatialTrackerV2_Front", offload_block=True, enable_chunking=True
+            ).eval().to(device=device, dtype=dtype)
+            
             with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                 with torch.no_grad():
                     with torch.amp.autocast(device_type="cuda", dtype=dtype):
@@ -198,10 +183,21 @@ def run_benchmark():
             extrs_gt = predictions_gt["poses_pred"][0].float().cpu().numpy()
             extrs_gt_c2w = np.linalg.inv(extrs_gt).astype(np.float32)
             
-            del predictions_gt
+            # Unload VGGT4Track
+            del predictions_gt, vggt_model
+            gc.collect()
             torch.cuda.empty_cache()
             
-            # Run Predictor to obtain GT labels
+            # Refinement Phase GT
+            predictor = Predictor.from_pretrained("Yuxihenry/SpatialTrackerV2-Online")
+            predictor.spatrack.track_num = 120
+            predictor.S_wind = 30
+            predictor.overlap = 10
+            predictor.eval().to(device)
+            if hasattr(predictor.spatrack, "base_model") and predictor.spatrack.base_model is not None:
+                predictor.spatrack.base_model.to("cpu")
+            torch.cuda.empty_cache()
+            
             with torch.no_grad():
                 with torch.amp.autocast(device_type="cuda", dtype=dtype):
                     (
@@ -218,48 +214,77 @@ def run_benchmark():
             coords_gt_label = (torch.einsum("tij,tnj->tni", c2w_traj_gt[:,:3,:3], track3d_gt[:,:,:3].cpu()) + c2w_traj_gt[:,:3,3][:,None,:]).numpy()
             vis_gt_label = vis_gt.cpu().numpy()
             
-            # 2. Run Test Resolutions
+            # Unload Predictor
+            del predictor
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # -------------------------------------------------------------
+            # TEST RESOLUTIONS RUN
+            # -------------------------------------------------------------
             for R in test_resolutions:
-                # Preprocess video at resolution R
-                W_R, H_R = compute_aspect_preserving_size(W_orig, H_orig, R)
+                # -- Phase 1: VGGT4Track Preprocessing at resolution R --
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
                 
+                W_R, H_R = compute_aspect_preserving_size(W_orig, H_orig, R)
                 preprocess_frames_R = []
                 for t in range(actual_len):
                     img_proc = preprocess_image(video_tensor_gt_L[t], target_size=R)
                     preprocess_frames_R.append(img_proc)
                 vggt_input_R = torch.stack(preprocess_frames_R).to(device=device, dtype=dtype)
                 
+                vggt_model = VGGT4Track.from_pretrained(
+                    "Yuxihenry/SpatialTrackerV2_Front", offload_block=True, enable_chunking=True
+                ).eval().to(device=device, dtype=dtype)
+                
                 with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
                     with torch.no_grad():
                         with torch.amp.autocast(device_type="cuda", dtype=dtype):
                             predictions_R = vggt_model(vggt_input_R[None] / 255.0)
                 
-                depth_R = predictions_R["points_map"][..., 2].float() # (actual_len, H_R, W_R)
-                unc_metric_R = predictions_R["unc_metric"].float() # (actual_len, H_R, W_R)
+                depth_R = predictions_R["points_map"][..., 2].float().cpu() # Move to host CPU immediately
+                unc_metric_R = predictions_R["unc_metric"].float().cpu()
                 intrs_R = predictions_R["intrs"][0].float().cpu().numpy()
                 extrs_R = predictions_R["poses_pred"][0].float().cpu().numpy()
                 extrs_R_c2w = np.linalg.inv(extrs_R).astype(np.float32)
                 
-                del predictions_R
+                # Unload VGGT4Track & get peak memory for Preprocess Phase
+                del predictions_R, vggt_model
+                gc.collect()
                 torch.cuda.empty_cache()
+                peak_vggt = torch.cuda.max_memory_allocated() / (1024 ** 2)
                 
-                # Interpolate depth and unc_metric back to ground truth size (H_gt, W_gt)
+                # -- Phase 2: Predictor Refinement at resolution 518 --
+                torch.cuda.reset_peak_memory_stats()
+                
+                # Interpolate preprocessed outputs back to ground truth resolution
                 depth_interp = F.interpolate(
-                    depth_R.unsqueeze(1), size=(H_gt, W_gt), mode='bilinear', align_corners=True
-                ).squeeze(1).cpu().numpy()
+                    depth_R.unsqueeze(0).unsqueeze(1), size=(H_gt, W_gt), mode='bilinear', align_corners=True
+                ).squeeze(0).squeeze(0).numpy()
                 
                 unc_interp = (F.interpolate(
-                    unc_metric_R.unsqueeze(1), size=(H_gt, W_gt), mode='bilinear', align_corners=True
-                ).squeeze(1).cpu().numpy() > 0.5)
+                    unc_metric_R.unsqueeze(0).unsqueeze(1), size=(H_gt, W_gt), mode='bilinear', align_corners=True
+                ).squeeze(0).squeeze(0).numpy() > 0.5)
                 
-                # Scale intrinsics appropriately
+                # Scale intrinsics
                 scale_w = W_gt / W_R
                 scale_h = H_gt / H_R
                 intrs_scaled = intrs_R.copy()
                 intrs_scaled[:, 0, :] *= scale_w
                 intrs_scaled[:, 1, :] *= scale_h
                 
-                # Run Predictor at GT resolution using interpolated preprocessed data
+                predictor = Predictor.from_pretrained("Yuxihenry/SpatialTrackerV2-Online")
+                predictor.spatrack.track_num = 120
+                predictor.S_wind = 30
+                predictor.overlap = 10
+                predictor.eval().to(device)
+                if hasattr(predictor.spatrack, "base_model") and predictor.spatrack.base_model is not None:
+                    predictor.spatrack.base_model.to("cpu")
+                torch.cuda.empty_cache()
+                
+                # Run Refiner
                 with torch.no_grad():
                     with torch.amp.autocast(device_type="cuda", dtype=dtype):
                         (
@@ -276,33 +301,46 @@ def run_benchmark():
                 coords_pred_label = (torch.einsum("tij,tnj->tni", c2w_traj_pred[:,:3,:3], track3d_pred[:,:,:3].cpu()) + c2w_traj_pred[:,:3,3][:,None,:]).numpy()
                 vis_pred_label = vis_pred.cpu().numpy()
                 
+                # Unload Predictor & get peak memory for Refinement Phase
+                del predictor
+                gc.collect()
+                torch.cuda.empty_cache()
+                peak_refiner = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                
+                # Overall peak is the maximum of the two independent passes
+                total_peak_mem = max(peak_vggt, peak_refiner)
+
                 # Calculate metrics
                 metrics = compute_3d_metrics(coords_gt_label, vis_gt_label, coords_pred_label, vis_pred_label)
+                metrics["peak_vggt"] = peak_vggt
+                metrics["peak_refiner"] = peak_refiner
+                metrics["peak_total"] = total_peak_mem
                 eval_results[L][R].append(metrics)
                 
-                print(f"    Res {R}x{R} -> AJ-3D: {metrics['average_jaccard']:.4f} | AP-3D: {metrics['average_position_accuracy']:.4f} | OA: {metrics['occlusion_accuracy']:.4f}")
+                print(f"    Res {R}x{R} -> AJ-3D: {metrics['average_jaccard']:.4f} | AP-3D: {metrics['average_position_accuracy']:.4f} | OA: {metrics['occlusion_accuracy']:.4f} | VGGT Peak: {peak_vggt:.2f} MB | Refiner Peak: {peak_refiner:.2f} MB | Max Peak VRAM: {total_peak_mem:.2f} MB")
 
     # Aggregate and average metrics over all processed videos
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("RESOLUTION BENCHMARK COMPLETED")
-    print("=" * 80)
+    print("=" * 100)
     
     # Save Report
     report_path = "benchmark_resolution_results.md"
     with open(report_path, "w") as f:
         f.write("# VGGT4Track Preprocessing Resolution Benchmark Report\n\n")
         f.write("- **Methodology**: Ground truth computed using Preprocessing at 518x518. Lower resolutions preprocessed, interpolated back, and run in the track refiner at 518x518.\n")
+        f.write("- **Execution Protocol**: Run in 2 passes sequentially (VGGT Preprocessing phase first, then unloaded, followed by Predictor tracking phase, and then unloaded). Peak VRAM represents the maximum memory utilized in either phase.\n")
         f.write("- **Metrics averaged across 10 videos** using 48 query points (8x6 grid).\n\n")
         
         for L in lengths:
             f.write(f"## Sequence Length: {L} frames\n\n")
-            f.write("| Preprocess Resolution | 3D Average Jaccard (AJ) | Average 3D Position Accuracy (AP) | Occlusion Accuracy (OA) |\n")
-            f.write("| --- | --- | --- | --- |\n")
+            f.write("| Preprocess Resolution | AJ-3D | AP-3D | OA-3D | VGGT Peak VRAM | Refiner Peak VRAM | Combined Max Peak |\n")
+            f.write("| --- | --- | --- | --- | --- | --- | --- |\n")
             
             print(f"\nSequence Length: {L} frames")
-            print("-" * 80)
-            print(f"{'Resolution':<12} | {'3D Average Jaccard':<20} | {'Average 3D Position':<20} | {'Occlusion Accuracy':<20}")
-            print("-" * 80)
+            print("-" * 120)
+            print(f"{'Resolution':<12} | {'AJ-3D':<10} | {'AP-3D':<10} | {'OA-3D':<10} | {'VGGT Peak VRAM':<18} | {'Refiner Peak':<18} | {'Max Peak (MB)':<15}")
+            print("-" * 120)
             
             for R in test_resolutions:
                 metrics_list = eval_results[L][R]
@@ -311,11 +349,14 @@ def run_benchmark():
                 mean_aj = np.mean([m["average_jaccard"] for m in metrics_list])
                 mean_ap = np.mean([m["average_position_accuracy"] for m in metrics_list])
                 mean_oa = np.mean([m["occlusion_accuracy"] for m in metrics_list])
+                mean_vggt_mem = np.mean([m["peak_vggt"] for m in metrics_list])
+                mean_refiner_mem = np.mean([m["peak_refiner"] for m in metrics_list])
+                mean_peak_mem = np.mean([m["peak_total"] for m in metrics_list])
                 
-                row_str = f"| {R}x{R} | {mean_aj:.4f} | {mean_ap:.4f} | {mean_oa:.4f} |\n"
+                row_str = f"| {R}x{R} | {mean_aj:.4f} | {mean_ap:.4f} | {mean_oa:.4f} | {mean_vggt_mem:.2f} MB | {mean_refiner_mem:.2f} MB | {mean_peak_mem:.2f} MB |\n"
                 f.write(row_str)
                 
-                print(f"{f'{R}x{R}':<12} | {mean_aj:<20.4f} | {mean_ap:<20.4f} | {mean_oa:<20.4f}")
+                print(f"{f'{R}x{R}':<12} | {mean_aj:<10.4f} | {mean_ap:<10.4f} | {mean_oa:<10.4f} | {f'{mean_vggt_mem:.2f} MB':<18} | {f'{mean_refiner_mem:.2f} MB':<18} | {mean_peak_mem:<15.2f}")
             f.write("\n")
             
     print(f"\nFull report written to {report_path}")
