@@ -49,10 +49,11 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-        self.enable_chunking = enable_chunking
-
     def forward(self, x: Tensor, pos=None) -> Tensor:
         B, N, C = x.shape
+        # qkv starts on whatever device x is on (presumably CUDA)
+        orig_device = x.device
+        
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
@@ -66,34 +67,9 @@ class Attention(nn.Module):
         MAX_B = 16 # Adjust based on your GPU memory limits
 
         if self.fused_attn:
-            if not self.training and self.enable_chunking and (N > MAX_N or B > MAX_B):
-                b_split_size = MAX_B if B > MAX_B else B
-                q_batches = torch.split(q, b_split_size, dim=0)
-                k_batches = torch.split(k, b_split_size, dim=0)
-                v_batches = torch.split(v, b_split_size, dim=0)
-                
-                x_b_chunks = []
-                for q_b, k_b, v_b in zip(q_batches, k_batches, v_batches):
-                    if N > MAX_N:
-                        q_chunks = torch.split(q_b, MAX_N, dim=2)
-                        x_n_chunks = []
-                        for q_chunk in q_chunks:
-                            x_chunk = F.scaled_dot_product_attention(
-                                q_chunk, k_b, v_b, dropout_p=0.0
-                            )
-                            x_n_chunks.append(x_chunk)
-                        x_b_chunks.append(torch.cat(x_n_chunks, dim=2))
-                    else:
-                        x_chunk = F.scaled_dot_product_attention(
-                            q_b, k_b, v_b, dropout_p=0.0
-                        )
-                        x_b_chunks.append(x_chunk)
-                
-                x = torch.cat(x_b_chunks, dim=0)
-            else:
-                x = F.scaled_dot_product_attention(
-                    q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0,
-                )
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0,
+            )
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
@@ -101,6 +77,7 @@ class Attention(nn.Module):
             attn = self.attn_drop(attn)
             x = attn @ v
 
+        # If we offloaded to CPU, x is now safely back on the original GPU device
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
